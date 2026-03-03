@@ -1,0 +1,485 @@
+const std = @import("std");
+const handshake_mod = @import("handshake.zig");
+const key_schedule_mod = @import("key_schedule.zig");
+const keys_mod = @import("../crypto/keys.zig");
+const transport_params_mod = @import("../core/transport_params.zig");
+
+pub const TlsError = error{
+    HandshakeFailed,
+    AlpnMismatch,
+    InvalidState,
+    UnsupportedCipherSuite,
+    OutOfMemory,
+} || handshake_mod.HandshakeError || key_schedule_mod.KeyScheduleError;
+
+pub const HandshakeState = enum {
+    idle,
+    client_hello_sent,
+    server_hello_received,
+    handshake_complete,
+    failed,
+
+    pub fn isComplete(self: HandshakeState) bool {
+        return self == .handshake_complete;
+    }
+};
+
+pub const TlsContext = struct {
+    allocator: std.mem.Allocator,
+    is_client: bool,
+    state: HandshakeState,
+    cipher_suite: ?u16 = null,
+    key_schedule: ?*key_schedule_mod.KeySchedule = null,
+    transcript: std.ArrayList(u8),
+    handshake_client_secret: ?[]u8 = null,
+    handshake_server_secret: ?[]u8 = null,
+    application_client_secret: ?[]u8 = null,
+    application_server_secret: ?[]u8 = null,
+    selected_alpn: ?[]u8 = null,
+    offered_alpn: ?[]u8 = null,
+    peer_transport_params: ?[]u8 = null,
+
+    pub fn init(allocator: std.mem.Allocator, is_client: bool) TlsContext {
+        return .{
+            .allocator = allocator,
+            .is_client = is_client,
+            .state = .idle,
+            .transcript = .{},
+        };
+    }
+
+    pub fn startClientHandshake(self: *TlsContext, server_name: []const u8) TlsError![]u8 {
+        return self.startClientHandshakeWithParams(server_name, &[_][]const u8{}, &[_]u8{});
+    }
+
+    pub fn startClientHandshakeWithParams(
+        self: *TlsContext,
+        server_name: []const u8,
+        alpn_protocols: []const []const u8,
+        quic_transport_params: []const u8,
+    ) TlsError![]u8 {
+        if (!self.is_client or self.state != .idle) return error.InvalidState;
+        _ = server_name;
+
+        _ = transport_params_mod.TransportParams.decode(self.allocator, quic_transport_params) catch {
+            return error.HandshakeFailed;
+        };
+
+        if (self.selected_alpn) |alpn| {
+            self.allocator.free(alpn);
+            self.selected_alpn = null;
+        }
+        if (self.offered_alpn) |offered| {
+            self.allocator.free(offered);
+            self.offered_alpn = null;
+        }
+        if (self.peer_transport_params) |tp| {
+            self.allocator.free(tp);
+            self.peer_transport_params = null;
+        }
+
+        var random: [32]u8 = undefined;
+        std.crypto.random.bytes(&random);
+
+        const cipher_suites = [_]u16{
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_AES_256_GCM_SHA384,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+        };
+
+        var ext_list: [2]handshake_mod.Extension = undefined;
+        var ext_count: usize = 0;
+
+        if (alpn_protocols.len > 0) {
+            const alpn_data = try encodeAlpnExtensionData(self.allocator, alpn_protocols);
+            errdefer self.allocator.free(alpn_data);
+            self.offered_alpn = try self.allocator.dupe(u8, alpn_data);
+            ext_list[ext_count] = .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+                .extension_data = alpn_data,
+            };
+            ext_count += 1;
+        }
+
+        if (quic_transport_params.len > 0) {
+            ext_list[ext_count] = .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+                .extension_data = quic_transport_params,
+            };
+            ext_count += 1;
+        }
+
+        const client_hello = handshake_mod.ClientHello{
+            .random = random,
+            .cipher_suites = &cipher_suites,
+            .extensions = ext_list[0..ext_count],
+        };
+
+        const encoded = try client_hello.encode(self.allocator);
+        if (ext_count > 0 and alpn_protocols.len > 0) self.allocator.free(ext_list[0].extension_data);
+
+        self.transcript.clearRetainingCapacity();
+        try self.transcript.appendSlice(self.allocator, encoded);
+        self.state = .client_hello_sent;
+        return encoded;
+    }
+
+    pub fn buildServerHelloFromClientHello(
+        self: *TlsContext,
+        client_hello_data: []const u8,
+        server_supported_alpn: []const []const u8,
+        quic_transport_params: []const u8,
+    ) TlsError![]u8 {
+        if (self.is_client or self.state != .idle) return error.InvalidState;
+
+        _ = transport_params_mod.TransportParams.decode(self.allocator, quic_transport_params) catch {
+            return error.HandshakeFailed;
+        };
+
+        const parsed_client_hello = handshake_mod.parseClientHello(client_hello_data) catch return error.HandshakeFailed;
+        const selected_cipher = selectServerCipherSuite(parsed_client_hello.cipher_suites) orelse return error.UnsupportedCipherSuite;
+
+        const selected_alpn = try selectServerAlpnFromClientHello(client_hello_data, server_supported_alpn);
+        const selected_alpn_wire = try encodeSelectedAlpnExtensionData(self.allocator, selected_alpn);
+        errdefer self.allocator.free(selected_alpn_wire);
+
+        const client_tp = handshake_mod.findUniqueExtension(parsed_client_hello.extensions, @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters)) catch return error.HandshakeFailed;
+        const client_tp_payload = client_tp orelse return error.HandshakeFailed;
+        _ = transport_params_mod.TransportParams.decode(self.allocator, client_tp_payload) catch return error.HandshakeFailed;
+
+        const copied_client_tp = try self.allocator.dupe(u8, client_tp_payload);
+        errdefer self.allocator.free(copied_client_tp);
+        if (self.peer_transport_params) |old_tp| self.allocator.free(old_tp);
+        self.peer_transport_params = copied_client_tp;
+
+        if (self.selected_alpn) |old_alpn| self.allocator.free(old_alpn);
+        self.selected_alpn = try self.allocator.dupe(u8, selected_alpn);
+
+        var random: [32]u8 = undefined;
+        std.crypto.random.bytes(&random);
+
+        const ext = [_]handshake_mod.Extension{
+            .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = selected_alpn_wire },
+            .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = quic_transport_params },
+        };
+
+        const server_hello = handshake_mod.ServerHello{ .random = random, .cipher_suite = selected_cipher, .extensions = &ext };
+        const encoded = try server_hello.encode(self.allocator);
+        self.allocator.free(selected_alpn_wire);
+
+        self.transcript.clearRetainingCapacity();
+        try self.transcript.appendSlice(self.allocator, client_hello_data);
+        try self.transcript.appendSlice(self.allocator, encoded);
+
+        self.cipher_suite = selected_cipher;
+        self.state = .server_hello_received;
+        return encoded;
+    }
+
+    pub fn processServerHello(self: *TlsContext, server_hello_data: []const u8) TlsError!void {
+        if (!self.is_client or self.state != .client_hello_sent) return error.InvalidState;
+
+        const parsed = handshake_mod.parseServerHello(server_hello_data) catch return error.HandshakeFailed;
+        switch (parsed.cipher_suite) {
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_AES_256_GCM_SHA384,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+            => self.cipher_suite = parsed.cipher_suite,
+            else => return error.UnsupportedCipherSuite,
+        }
+
+        try self.maybeStoreSelectedAlpn(parsed.extensions);
+        try self.verifySelectedAlpnAgainstOffer();
+        try self.maybeStorePeerTransportParams(parsed.extensions);
+        try self.transcript.appendSlice(self.allocator, server_hello_data);
+        self.state = .server_hello_received;
+    }
+
+    pub fn completeHandshake(self: *TlsContext, shared_secret: []const u8) TlsError!void {
+        if (self.state != .server_hello_received) return error.InvalidState;
+
+        const hash_alg: key_schedule_mod.HashAlgorithm = switch (self.cipher_suite orelse handshake_mod.TLS_AES_128_GCM_SHA256) {
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+            => .sha256,
+            handshake_mod.TLS_AES_256_GCM_SHA384 => .sha384,
+            else => return error.UnsupportedCipherSuite,
+        };
+
+        var ks = try key_schedule_mod.KeySchedule.init(self.allocator, hash_alg);
+        errdefer ks.deinit();
+
+        const early_secret = try ks.deriveEarlySecret(null);
+        defer self.allocator.free(early_secret);
+        const handshake_secret = try ks.deriveHandshakeSecret(early_secret, shared_secret);
+        defer self.allocator.free(handshake_secret);
+
+        ks.updateTranscript(self.transcript.items);
+
+        const hs_secrets = try ks.deriveHandshakeTrafficSecrets(handshake_secret);
+        errdefer {
+            @memset(hs_secrets.client, 0);
+            self.allocator.free(hs_secrets.client);
+            @memset(hs_secrets.server, 0);
+            self.allocator.free(hs_secrets.server);
+        }
+
+        const master_secret = try ks.deriveMasterSecret(handshake_secret);
+        defer self.allocator.free(master_secret);
+
+        const app_secrets = try ks.deriveApplicationTrafficSecrets(master_secret);
+        errdefer {
+            @memset(app_secrets.client, 0);
+            self.allocator.free(app_secrets.client);
+            @memset(app_secrets.server, 0);
+            self.allocator.free(app_secrets.server);
+        }
+
+        self.handshake_client_secret = hs_secrets.client;
+        self.handshake_server_secret = hs_secrets.server;
+        self.application_client_secret = app_secrets.client;
+        self.application_server_secret = app_secrets.server;
+
+        const ks_ptr = try self.allocator.create(key_schedule_mod.KeySchedule);
+        ks_ptr.* = ks;
+        self.key_schedule = ks_ptr;
+        self.state = .handshake_complete;
+    }
+
+    pub fn getSelectedAlpn(self: *const TlsContext) ?[]const u8 {
+        return self.selected_alpn;
+    }
+
+    pub fn getPeerTransportParams(self: *const TlsContext) ?[]const u8 {
+        return self.peer_transport_params;
+    }
+
+    pub fn selectServerAlpn(offered_alpn_wire: []const u8, server_supported: []const []const u8) TlsError![]const u8 {
+        if (offered_alpn_wire.len < 2) return error.HandshakeFailed;
+
+        const list_len: usize = (@as(usize, offered_alpn_wire[0]) << 8) | offered_alpn_wire[1];
+        if (list_len + 2 != offered_alpn_wire.len) return error.HandshakeFailed;
+
+        for (server_supported) |candidate| {
+            if (candidate.len == 0) continue;
+            if (isAlpnInOffer(offered_alpn_wire, candidate)) return candidate;
+        }
+        return error.AlpnMismatch;
+    }
+
+    pub fn selectServerAlpnFromClientHello(client_hello_data: []const u8, server_supported: []const []const u8) TlsError![]const u8 {
+        const parsed = handshake_mod.parseClientHello(client_hello_data) catch return error.HandshakeFailed;
+        const offered_alpn = handshake_mod.findUniqueExtension(parsed.extensions, @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation)) catch return error.HandshakeFailed;
+        const offered_alpn_wire = offered_alpn orelse return error.HandshakeFailed;
+        return selectServerAlpn(offered_alpn_wire, server_supported);
+    }
+
+    pub fn encodeSelectedAlpnExtensionData(allocator: std.mem.Allocator, selected: []const u8) TlsError![]u8 {
+        if (selected.len == 0 or selected.len > 255) return error.HandshakeFailed;
+        const out = try allocator.alloc(u8, selected.len + 3);
+        out[0] = @intCast(((selected.len + 1) >> 8) & 0xFF);
+        out[1] = @intCast((selected.len + 1) & 0xFF);
+        out[2] = @intCast(selected.len);
+        @memcpy(out[3 .. 3 + selected.len], selected);
+        return out;
+    }
+
+    fn encodeAlpnExtensionData(allocator: std.mem.Allocator, protocols: []const []const u8) TlsError![]u8 {
+        var list_len: usize = 0;
+        for (protocols) |protocol| {
+            if (protocol.len == 0 or protocol.len > 255) return error.HandshakeFailed;
+            list_len += 1 + protocol.len;
+        }
+        if (list_len > std.math.maxInt(u16)) return error.HandshakeFailed;
+
+        var out = try allocator.alloc(u8, list_len + 2);
+        var pos: usize = 0;
+        out[pos] = @intCast((list_len >> 8) & 0xFF);
+        pos += 1;
+        out[pos] = @intCast(list_len & 0xFF);
+        pos += 1;
+
+        for (protocols) |protocol| {
+            out[pos] = @intCast(protocol.len);
+            pos += 1;
+            @memcpy(out[pos..][0..protocol.len], protocol);
+            pos += protocol.len;
+        }
+
+        return out;
+    }
+
+    fn verifyFinishedData(
+        self: *TlsContext,
+        ks: *key_schedule_mod.KeySchedule,
+        server_handshake_secret: []const u8,
+        peer_verify_data: []const u8,
+    ) TlsError!void {
+        const hash_len = ks.hash_alg.digestLength();
+        if (peer_verify_data.len != hash_len) return error.HandshakeFailed;
+
+        const finished_key = try self.allocator.alloc(u8, hash_len);
+        defer {
+            @memset(finished_key, 0);
+            self.allocator.free(finished_key);
+        }
+
+        keys_mod.hkdfExpandLabel(server_handshake_secret, "finished", "", hash_len, ks.hash_alg, finished_key) catch return error.HandshakeFailed;
+
+        const expected_verify_data = try self.allocator.alloc(u8, hash_len);
+        defer {
+            @memset(expected_verify_data, 0);
+            self.allocator.free(expected_verify_data);
+        }
+
+        switch (ks.hash_alg) {
+            .sha256 => {
+                var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(finished_key);
+                hmac.update(ks.transcript_hash);
+                hmac.final(expected_verify_data[0..32]);
+            },
+            .sha384 => {
+                var hmac = std.crypto.auth.hmac.sha2.HmacSha384.init(finished_key);
+                hmac.update(ks.transcript_hash);
+                hmac.final(expected_verify_data[0..48]);
+            },
+            .sha512 => {
+                var hmac = std.crypto.auth.hmac.sha2.HmacSha512.init(finished_key);
+                hmac.update(ks.transcript_hash);
+                hmac.final(expected_verify_data[0..64]);
+            },
+        }
+
+        if (!std.mem.eql(u8, peer_verify_data, expected_verify_data)) return error.HandshakeFailed;
+    }
+
+    fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
+        const alpn_data_opt = handshake_mod.findUniqueExtension(extensions, @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation)) catch return error.HandshakeFailed;
+        const alpn_data = alpn_data_opt orelse return;
+        if (alpn_data.len < 3) return error.HandshakeFailed;
+
+        const list_len: usize = (@as(usize, alpn_data[0]) << 8) | alpn_data[1];
+        if (list_len + 2 != alpn_data.len) return error.HandshakeFailed;
+
+        const name_len: usize = alpn_data[2];
+        if (name_len == 0) return error.HandshakeFailed;
+        if (3 + name_len != alpn_data.len) return error.HandshakeFailed;
+
+        const selected = try self.allocator.dupe(u8, alpn_data[3 .. 3 + name_len]);
+        if (self.selected_alpn) |old| self.allocator.free(old);
+        self.selected_alpn = selected;
+    }
+
+    fn verifySelectedAlpnAgainstOffer(self: *TlsContext) TlsError!void {
+        const offered = self.offered_alpn orelse return;
+        const selected = self.selected_alpn orelse return error.HandshakeFailed;
+        if (!isAlpnInOffer(offered, selected)) return error.AlpnMismatch;
+    }
+
+    fn maybeStorePeerTransportParams(self: *TlsContext, extensions: []const u8) TlsError!void {
+        const tp_data_opt = handshake_mod.findUniqueExtension(extensions, @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters)) catch return error.HandshakeFailed;
+        const tp_data = tp_data_opt orelse return;
+
+        _ = transport_params_mod.TransportParams.decode(self.allocator, tp_data) catch return error.HandshakeFailed;
+        const copied = try self.allocator.dupe(u8, tp_data);
+        if (self.peer_transport_params) |old| self.allocator.free(old);
+        self.peer_transport_params = copied;
+    }
+
+    fn isAlpnInOffer(offered_wire: []const u8, selected: []const u8) bool {
+        if (offered_wire.len < 2) return false;
+
+        const list_len: usize = (@as(usize, offered_wire[0]) << 8) | offered_wire[1];
+        if (list_len + 2 != offered_wire.len) return false;
+
+        var pos: usize = 2;
+        while (pos < offered_wire.len) {
+            const protocol_len = offered_wire[pos];
+            pos += 1;
+            if (protocol_len == 0) return false;
+            if (pos + protocol_len > offered_wire.len) return false;
+            if (std.mem.eql(u8, offered_wire[pos .. pos + protocol_len], selected)) return true;
+            pos += protocol_len;
+        }
+
+        return false;
+    }
+
+    fn selectServerCipherSuite(offered_cipher_suites: []const u8) ?u16 {
+        if ((offered_cipher_suites.len & 1) != 0) return null;
+
+        const preferred = [_]u16{
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_AES_256_GCM_SHA384,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+        };
+
+        for (preferred) |candidate| {
+            var i: usize = 0;
+            while (i + 1 < offered_cipher_suites.len) : (i += 2) {
+                const offered: u16 = (@as(u16, offered_cipher_suites[i]) << 8) | offered_cipher_suites[i + 1];
+                if (offered == candidate) return candidate;
+            }
+        }
+        return null;
+    }
+
+    pub fn deinit(self: *TlsContext) void {
+        if (self.handshake_client_secret) |secret| {
+            @memset(secret, 0);
+            self.allocator.free(secret);
+        }
+        if (self.handshake_server_secret) |secret| {
+            @memset(secret, 0);
+            self.allocator.free(secret);
+        }
+        if (self.application_client_secret) |secret| {
+            @memset(secret, 0);
+            self.allocator.free(secret);
+        }
+        if (self.application_server_secret) |secret| {
+            @memset(secret, 0);
+            self.allocator.free(secret);
+        }
+        if (self.selected_alpn) |alpn| self.allocator.free(alpn);
+        if (self.offered_alpn) |offered| self.allocator.free(offered);
+        if (self.peer_transport_params) |tp| self.allocator.free(tp);
+
+        if (self.key_schedule) |ks| {
+            ks.deinit();
+            self.allocator.destroy(ks);
+        }
+        self.transcript.deinit(self.allocator);
+    }
+};
+
+test "tls context client server flow" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var ctp = transport_params_mod.TransportParams.defaultClient();
+    const ctp_bytes = try ctp.encode(allocator);
+    defer allocator.free(ctp_bytes);
+
+    var stp = transport_params_mod.TransportParams.defaultServer();
+    const stp_bytes = try stp.encode(allocator);
+    defer allocator.free(stp_bytes);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, ctp_bytes);
+    defer allocator.free(ch);
+
+    const sh = try server.buildServerHelloFromClientHello(ch, &offered, stp_bytes);
+    defer allocator.free(sh);
+
+    try client.processServerHello(sh);
+    try client.completeHandshake("shared-secret");
+    try server.completeHandshake("shared-secret");
+
+    try std.testing.expect(client.state.isComplete());
+    try std.testing.expect(server.state.isComplete());
+}

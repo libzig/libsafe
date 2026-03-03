@@ -1,32 +1,20 @@
 const std = @import("std");
 const engine = @import("../engine.zig");
+const tls_context_mod = @import("../tls/tls_context.zig");
 
 pub const LibfastTlsContextAdapter = struct {
     allocator: std.mem.Allocator,
-    role: engine.Role,
-    handshake_state: engine.HandshakeState,
-    selected_alpn: ?[]u8,
-    peer_transport_params: ?[]u8,
+    inner: tls_context_mod.TlsContext,
 
     pub fn init(allocator: std.mem.Allocator, role: engine.Role) LibfastTlsContextAdapter {
         return .{
             .allocator = allocator,
-            .role = role,
-            .handshake_state = .idle,
-            .selected_alpn = null,
-            .peer_transport_params = null,
+            .inner = tls_context_mod.TlsContext.init(allocator, role == .client),
         };
     }
 
     pub fn deinit(self: *LibfastTlsContextAdapter) void {
-        if (self.selected_alpn) |alpn| {
-            self.allocator.free(alpn);
-            self.selected_alpn = null;
-        }
-        if (self.peer_transport_params) |tp| {
-            self.allocator.free(tp);
-            self.peer_transport_params = null;
-        }
+        self.inner.deinit();
     }
 
     pub fn asEngine(self: *LibfastTlsContextAdapter) engine.Engine {
@@ -56,33 +44,12 @@ pub const LibfastTlsContextAdapter = struct {
         local_transport_params: []const u8,
     ) engine.EngineError![]u8 {
         const self = cast(ctx);
-        _ = server_name;
-
-        if (self.role != .client or self.handshake_state != .idle) {
-            return error.InvalidState;
-        }
-
-        if (self.selected_alpn) |old| {
-            self.allocator.free(old);
-            self.selected_alpn = null;
-        }
-        if (alpn_protocols.len > 0) {
-            self.selected_alpn = self.allocator.dupe(u8, alpn_protocols[0]) catch {
-                return error.OutOfMemory;
-            };
-        }
-
-        if (self.peer_transport_params) |old_tp| {
-            self.allocator.free(old_tp);
-            self.peer_transport_params = null;
-        }
-        self.peer_transport_params = self.allocator.dupe(u8, local_transport_params) catch {
-            return error.OutOfMemory;
-        };
-
-        self.handshake_state = .client_hello_sent;
-        return self.allocator.dupe(u8, "libsafe-client-hello-v0") catch {
-            return error.OutOfMemory;
+        return self.inner.startClientHandshakeWithParams(
+            server_name,
+            alpn_protocols,
+            local_transport_params,
+        ) catch |err| {
+            return mapError(err);
         };
     }
 
@@ -93,71 +60,48 @@ pub const LibfastTlsContextAdapter = struct {
         local_transport_params: []const u8,
     ) engine.EngineError![]u8 {
         const self = cast(ctx);
-        _ = client_hello_data;
-
-        if (self.role != .server or self.handshake_state != .idle) {
-            return error.InvalidState;
-        }
-
-        if (server_supported_alpn.len == 0) {
-            return error.AlpnMismatch;
-        }
-
-        if (self.selected_alpn) |old| {
-            self.allocator.free(old);
-            self.selected_alpn = null;
-        }
-        self.selected_alpn = self.allocator.dupe(u8, server_supported_alpn[0]) catch {
-            return error.OutOfMemory;
-        };
-
-        if (self.peer_transport_params) |old_tp| {
-            self.allocator.free(old_tp);
-            self.peer_transport_params = null;
-        }
-        self.peer_transport_params = self.allocator.dupe(u8, local_transport_params) catch {
-            return error.OutOfMemory;
-        };
-
-        self.handshake_state = .server_hello_received;
-        return self.allocator.dupe(u8, "libsafe-server-hello-v0") catch {
-            return error.OutOfMemory;
+        return self.inner.buildServerHelloFromClientHello(
+            client_hello_data,
+            server_supported_alpn,
+            local_transport_params,
+        ) catch |err| {
+            return mapError(err);
         };
     }
 
     fn processServerHelloErased(ctx: *anyopaque, server_hello_data: []const u8) engine.EngineError!void {
         const self = cast(ctx);
-        _ = server_hello_data;
-        if (self.role != .client or self.handshake_state != .client_hello_sent) {
-            return error.InvalidState;
-        }
-        self.handshake_state = .server_hello_received;
+        self.inner.processServerHello(server_hello_data) catch |err| {
+            return mapError(err);
+        };
     }
 
     fn completeHandshakeErased(ctx: *anyopaque, shared_secret: []const u8) engine.EngineError!void {
         const self = cast(ctx);
-        if (shared_secret.len == 0) {
-            return error.HandshakeFailed;
-        }
-        if (self.handshake_state != .server_hello_received) {
-            return error.InvalidState;
-        }
-        self.handshake_state = .handshake_complete;
+        self.inner.completeHandshake(shared_secret) catch |err| {
+            return mapError(err);
+        };
     }
 
     fn getSelectedAlpnErased(ctx: *const anyopaque) ?[]const u8 {
         const self = castConst(ctx);
-        return self.selected_alpn;
+        return self.inner.getSelectedAlpn();
     }
 
     fn getPeerTransportParamsErased(ctx: *const anyopaque) ?[]const u8 {
         const self = castConst(ctx);
-        return self.peer_transport_params;
+        return self.inner.getPeerTransportParams();
     }
 
     fn stateErased(ctx: *const anyopaque) engine.HandshakeState {
         const self = castConst(ctx);
-        return self.handshake_state;
+        return switch (self.inner.state) {
+            .idle => .idle,
+            .client_hello_sent => .client_hello_sent,
+            .server_hello_received => .server_hello_received,
+            .handshake_complete => .handshake_complete,
+            .failed => .failed,
+        };
     }
 
     fn freeBufferErased(ctx: *anyopaque, bytes: []u8) void {
@@ -176,6 +120,16 @@ pub const LibfastTlsContextAdapter = struct {
         .state = stateErased,
         .free_buffer = freeBufferErased,
     };
+
+    fn mapError(err: anyerror) engine.EngineError {
+        return switch (err) {
+            tls_context_mod.TlsError.InvalidState => error.InvalidState,
+            tls_context_mod.TlsError.AlpnMismatch => error.AlpnMismatch,
+            tls_context_mod.TlsError.UnsupportedCipherSuite => error.UnsupportedCipherSuite,
+            tls_context_mod.TlsError.OutOfMemory => error.OutOfMemory,
+            else => error.HandshakeFailed,
+        };
+    }
 };
 
 test "adapter begins client handshake" {
@@ -190,7 +144,7 @@ test "adapter begins client handshake" {
     const client_hello = try tls_engine.beginClientHandshake(
         "example.com",
         &offered,
-        "tp",
+        &[_]u8{},
     );
     defer tls_engine.freeBuffer(client_hello);
 
