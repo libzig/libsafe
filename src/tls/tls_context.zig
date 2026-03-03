@@ -483,3 +483,169 @@ test "tls context client server flow" {
     try std.testing.expect(client.state.isComplete());
     try std.testing.expect(server.state.isComplete());
 }
+
+fn makeServerHelloWithExtensions(
+    allocator: std.mem.Allocator,
+    extensions: []const handshake_mod.Extension,
+) ![]u8 {
+    const random: [32]u8 = [_]u8{77} ** 32;
+    const msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = extensions,
+    };
+    return msg.encode(allocator);
+}
+
+test "process server hello rejects malformed ALPN extension payload" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(ch);
+
+    const bad_alpn = [_]u8{ 0x00, 0x04, 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        .extension_data = &bad_alpn,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(sh));
+}
+
+test "process server hello rejects zero-length selected ALPN" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(ch);
+
+    const bad_alpn = [_]u8{ 0x00, 0x01, 0x00 };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        .extension_data = &bad_alpn,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(sh));
+}
+
+test "process server hello rejects invalid transport parameters extension payload" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(ch);
+
+    const bad_tp = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        .extension_data = &bad_tp,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(sh));
+}
+
+test "process server hello returns ALPN mismatch when server selects non-offered protocol" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(ch);
+
+    const alpn_h2 = [_]u8{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        .extension_data = &alpn_h2,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.AlpnMismatch, ctx.processServerHello(sh));
+}
+
+test "process server hello rejects duplicate ALPN extensions" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(ch);
+
+    const alpn_h3 = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h3 },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h3 },
+    };
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(sh));
+}
+
+test "process server hello rejects duplicate transport parameter extensions" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(ch);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = server_tp_encoded },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = server_tp_encoded },
+    };
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(sh));
+}
