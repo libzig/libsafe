@@ -5,8 +5,12 @@ const kex_methods = @import("kex_methods.zig");
 pub const DerivationError = error{
     InvalidHashAlgorithm,
     DerivationFailed,
+    InputTooLarge,
     OutOfMemory,
 };
+
+pub const MAX_SSH_MPINT_LENGTH: usize = 1024 * 1024;
+pub const MAX_SSH_STRING_LENGTH: usize = 1024 * 1024;
 
 pub const QuicSecrets = struct {
     client_initial_secret: [32]u8,
@@ -161,8 +165,15 @@ fn encodeSshSecretData(
     shared_secret_k: []const u8,
     exchange_hash_h: []const u8,
 ) DerivationError![]u8 {
-    const k_needs_padding = shared_secret_k.len > 0 and (shared_secret_k[0] & 0x80) != 0;
-    const k_len = shared_secret_k.len + @as(usize, if (k_needs_padding) 1 else 0);
+    if (exchange_hash_h.len > MAX_SSH_STRING_LENGTH) return error.InputTooLarge;
+
+    const encoded_k = try encodeCanonicalPositiveMpint(allocator, shared_secret_k);
+    defer {
+        @memset(encoded_k, 0);
+        allocator.free(encoded_k);
+    }
+
+    const k_len = encoded_k.len;
     const h_len = exchange_hash_h.len;
     const total_len = 4 + k_len + 4 + h_len;
 
@@ -170,16 +181,44 @@ fn encodeSshSecretData(
     errdefer allocator.free(out);
 
     std.mem.writeInt(u32, out[0..4], @intCast(k_len), .big);
-    if (k_needs_padding) {
-        out[4] = 0;
-        @memcpy(out[5 .. 5 + shared_secret_k.len], shared_secret_k);
-    } else {
-        @memcpy(out[4 .. 4 + shared_secret_k.len], shared_secret_k);
-    }
+    @memcpy(out[4 .. 4 + encoded_k.len], encoded_k);
 
     const h_offset = 4 + k_len;
     std.mem.writeInt(u32, out[h_offset..][0..4], @intCast(h_len), .big);
     @memcpy(out[h_offset + 4 .. h_offset + 4 + h_len], exchange_hash_h);
+
+    return out;
+}
+
+fn encodeCanonicalPositiveMpint(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) DerivationError![]u8 {
+    if (raw.len > MAX_SSH_MPINT_LENGTH) return error.InputTooLarge;
+
+    var first_non_zero: usize = 0;
+    while (first_non_zero < raw.len and raw[first_non_zero] == 0) {
+        first_non_zero += 1;
+    }
+
+    if (first_non_zero == raw.len) {
+        return allocator.alloc(u8, 0);
+    }
+
+    const magnitude = raw[first_non_zero..];
+    const needs_padding = (magnitude[0] & 0x80) != 0;
+    const encoded_len = magnitude.len + @as(usize, if (needs_padding) 1 else 0);
+    if (encoded_len > MAX_SSH_MPINT_LENGTH) return error.InputTooLarge;
+
+    const out = try allocator.alloc(u8, encoded_len);
+    errdefer allocator.free(out);
+
+    if (needs_padding) {
+        out[0] = 0;
+        @memcpy(out[1..], magnitude);
+    } else {
+        @memcpy(out, magnitude);
+    }
 
     return out;
 }
@@ -339,4 +378,66 @@ test "derive SSH QUIC exporter secret varies by label and context" {
 
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
     try std.testing.expect(!std.mem.eql(u8, &a, &c));
+}
+
+test "encode ssh secret data canonicalizes positive mpint" {
+    const allocator = std.testing.allocator;
+    const k = [_]u8{ 0x00, 0x00, 0x7F };
+    const h = "abc";
+
+    const encoded = try encodeSshSecretData(allocator, &k, h);
+    defer {
+        @memset(encoded, 0);
+        allocator.free(encoded);
+    }
+
+    const expected = [_]u8{
+        0x00, 0x00, 0x00, 0x01,
+        0x7F, 0x00, 0x00, 0x00,
+        0x03, 'a',  'b',  'c',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, encoded);
+}
+
+test "encode ssh secret data pads high-bit positive mpint" {
+    const allocator = std.testing.allocator;
+    const k = [_]u8{0x80};
+    const h = "h";
+
+    const encoded = try encodeSshSecretData(allocator, &k, h);
+    defer {
+        @memset(encoded, 0);
+        allocator.free(encoded);
+    }
+
+    const expected = [_]u8{
+        0x00, 0x00, 0x00, 0x02,
+        0x00, 0x80, 0x00, 0x00,
+        0x00, 0x01, 'h',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, encoded);
+}
+
+test "derive SSH QUIC secrets treat equivalent positive mpints the same" {
+    const allocator = std.testing.allocator;
+    const k_with_leading_zeros = [_]u8{ 0x00, 0x00, 0x11, 0x22, 0x33 };
+    const k_canonical = [_]u8{ 0x11, 0x22, 0x33 };
+    const h = "same-hash";
+
+    var a = try deriveSshQuicSecrets(allocator, &k_with_leading_zeros, h);
+    defer a.zeroize();
+    var b = try deriveSshQuicSecrets(allocator, &k_canonical, h);
+    defer b.zeroize();
+
+    try std.testing.expectEqualSlices(u8, &a.client_initial_secret, &b.client_initial_secret);
+    try std.testing.expectEqualSlices(u8, &a.server_initial_secret, &b.server_initial_secret);
+}
+
+test "encode canonical positive mpint rejects oversized input" {
+    const allocator = std.testing.allocator;
+    const oversized = try allocator.alloc(u8, MAX_SSH_MPINT_LENGTH + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 0x01);
+
+    try std.testing.expectError(error.InputTooLarge, encodeCanonicalPositiveMpint(allocator, oversized));
 }
