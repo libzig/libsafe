@@ -268,3 +268,60 @@ test "client and server hello encode parse" {
     const parsed_sh = try parseServerHello(sh_bytes);
     try std.testing.expectEqual(TLS_AES_128_GCM_SHA256, parsed_sh.cipher_suite);
 }
+
+test "parse client hello rejects truncated message" {
+    const allocator = std.testing.allocator;
+    const suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ch = ClientHello{ .random = [_]u8{0x10} ** 32, .cipher_suites = &suites, .extensions = &.{} };
+    const encoded = try ch.encode(allocator);
+    defer allocator.free(encoded);
+
+    try std.testing.expectError(error.InvalidMessage, parseClientHello(encoded[0 .. encoded.len - 1]));
+}
+
+test "parse client hello rejects invalid cipher suite list length" {
+    const allocator = std.testing.allocator;
+    const suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ch = ClientHello{ .random = [_]u8{0x20} ** 32, .cipher_suites = &suites, .extensions = &.{} };
+    const encoded = try ch.encode(allocator);
+    defer allocator.free(encoded);
+
+    var mutated = try allocator.dupe(u8, encoded);
+    defer allocator.free(mutated);
+
+    const cipher_len_offset = 4 + 2 + 32 + 1;
+    mutated[cipher_len_offset] = 0x00;
+    mutated[cipher_len_offset + 1] = 0x03;
+
+    try std.testing.expectError(error.InvalidMessage, parseClientHello(mutated));
+}
+
+test "parse server hello rejects truncated message" {
+    const allocator = std.testing.allocator;
+    const sh = ServerHello{ .random = [_]u8{0x30} ** 32, .cipher_suite = TLS_AES_128_GCM_SHA256, .extensions = &.{} };
+    const encoded = try sh.encode(allocator);
+    defer allocator.free(encoded);
+
+    try std.testing.expectError(error.InvalidMessage, parseServerHello(encoded[0 .. encoded.len - 2]));
+}
+
+test "find unique extension rejects duplicate extension types" {
+    const extensions = [_]u8{
+        0x00, 0x10, 0x00, 0x01, 0x01,
+        0x00, 0x10, 0x00, 0x01, 0x02,
+    };
+    try std.testing.expectError(
+        error.InvalidMessage,
+        findUniqueExtension(&extensions, @intFromEnum(ExtensionType.application_layer_protocol_negotiation)),
+    );
+}
+
+test "find unique extension rejects truncated extension payload" {
+    const extensions = [_]u8{
+        0x00, 0x39, 0x00, 0x05, 0xAA, 0xBB,
+    };
+    try std.testing.expectError(
+        error.InvalidMessage,
+        findUniqueExtension(&extensions, @intFromEnum(ExtensionType.quic_transport_parameters)),
+    );
+}
