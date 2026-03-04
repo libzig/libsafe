@@ -201,3 +201,54 @@ test "signature decode rejects oversized algorithm field" {
     std.mem.writeInt(u32, blob[0..4], @intCast(MAX_SSH_BLOB_FIELD_LENGTH + 1), .big);
     try std.testing.expectError(error.BlobTooLarge, decode_ed25519_signature_blob(blob[0..]));
 }
+
+test "strict validators accept valid host key and signature blobs" {
+    const allocator = std.testing.allocator;
+    const public_key: [32]u8 = [_]u8{0x12} ** 32;
+    const signature: [64]u8 = [_]u8{0x34} ** 64;
+
+    const host_key_blob = try encode_ed25519_host_key_blob(allocator, &public_key);
+    defer allocator.free(host_key_blob);
+    const signature_blob = try encode_ed25519_signature_blob(allocator, &signature);
+    defer allocator.free(signature_blob);
+
+    try validate_ed25519_host_key_blob(host_key_blob);
+    try validate_ed25519_signature_blob(signature_blob);
+}
+
+test "strict decoders reject unsupported algorithm names" {
+    const allocator = std.testing.allocator;
+
+    const host_blob = try allocator.alloc(u8, 4 + 7 + 4 + 32);
+    defer allocator.free(host_blob);
+    std.mem.writeInt(u32, host_blob[0..4], 7, .big);
+    @memcpy(host_blob[4..11], "ssh-rsa");
+    std.mem.writeInt(u32, host_blob[11..15], 32, .big);
+    @memset(host_blob[15..47], 0xAA);
+
+    const sig_blob = try allocator.alloc(u8, 4 + 7 + 4 + 64);
+    defer allocator.free(sig_blob);
+    std.mem.writeInt(u32, sig_blob[0..4], 7, .big);
+    @memcpy(sig_blob[4..11], "ssh-rsa");
+    std.mem.writeInt(u32, sig_blob[11..15], 64, .big);
+    @memset(sig_blob[15..79], 0xBB);
+
+    try std.testing.expectError(error.UnsupportedAlgorithm, decode_ed25519_host_key_blob_strict(host_blob));
+    try std.testing.expectError(error.UnsupportedAlgorithm, decode_ed25519_signature_blob_strict(sig_blob));
+}
+
+test "host key fingerprint is deterministic and prefixed" {
+    const allocator = std.testing.allocator;
+    const public_key: [32]u8 = [_]u8{0x77} ** 32;
+
+    const host_key_blob = try encode_ed25519_host_key_blob(allocator, &public_key);
+    defer allocator.free(host_key_blob);
+
+    const a = try fingerprint_sha256(allocator, host_key_blob);
+    defer allocator.free(a);
+    const b = try fingerprint_sha256(allocator, host_key_blob);
+    defer allocator.free(b);
+
+    try std.testing.expect(std.mem.startsWith(u8, a, "SHA256:"));
+    try std.testing.expectEqualStrings(a, b);
+}
