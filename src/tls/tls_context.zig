@@ -785,3 +785,65 @@ test "build server hello rejects duplicate client transport parameters" {
     try std.testing.expectEqual(HandshakeState.idle, server.state);
     try std.testing.expect(server.getPeerTransportParams() == null);
 }
+
+test "build server hello stores selected alpn and client transport params" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const sh = try server.buildServerHelloFromClientHello(ch, &offered, server_tp_encoded);
+    defer allocator.free(sh);
+
+    try std.testing.expectEqual(HandshakeState.server_hello_received, server.state);
+    const selected_alpn = server.getSelectedAlpn() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("h3", selected_alpn);
+    const peer_tp = server.getPeerTransportParams() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, client_tp_encoded, peer_tp);
+}
+
+test "build server hello ALPN mismatch does not mutate server state" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const unsupported = [_][]const u8{"h2"};
+
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    try std.testing.expectError(
+        error.AlpnMismatch,
+        server.buildServerHelloFromClientHello(ch, &unsupported, server_tp_encoded),
+    );
+
+    try std.testing.expectEqual(HandshakeState.idle, server.state);
+    try std.testing.expect(server.getSelectedAlpn() == null);
+    try std.testing.expect(server.getPeerTransportParams() == null);
+}
