@@ -6,6 +6,8 @@ pub const AuthCryptoError = error{
     SignatureBlobMalformed,
     SignatureAlgorithmMismatch,
     SignatureLengthInvalid,
+    HostKeyBlobMalformed,
+    HostKeyAlgorithmMismatch,
     PublicKeyLengthInvalid,
     VerificationFailed,
     OutOfMemory,
@@ -47,6 +49,22 @@ pub fn verify_ed25519_auth_signature_blob(
     if (!ssh_signature.verify_ed25519(payload, &decoded_signature, &public_key_fixed)) {
         return error.VerificationFailed;
     }
+}
+
+pub fn verify_ed25519_auth_signature_with_host_key_blob(
+    payload: []const u8,
+    signature_blob: []const u8,
+    host_key_blob: []const u8,
+) AuthCryptoError!void {
+    const decoded_public_key = ssh_hostkey.decode_ed25519_host_key_blob_strict(host_key_blob) catch |err| {
+        return switch (err) {
+            error.UnsupportedAlgorithm => error.HostKeyAlgorithmMismatch,
+            error.InvalidPublicKeyLength, error.InvalidHostKeyBlob, error.BlobTooLarge, error.TrailingData => error.HostKeyBlobMalformed,
+            else => error.HostKeyBlobMalformed,
+        };
+    };
+
+    return verify_ed25519_auth_signature_blob(payload, signature_blob, &decoded_public_key);
 }
 
 pub fn timing_safe_equal(a: []const u8, b: []const u8) bool {
@@ -149,6 +167,69 @@ test "auth signature verify rejects wrong payload and public key size" {
     try std.testing.expectError(
         error.PublicKeyLengthInvalid,
         verify_ed25519_auth_signature_blob("right", blob, "short"),
+    );
+}
+
+test "auth signature verify with host key blob happy path" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(991);
+    const kp = ssh_signature.KeyPair.generate(prng.random());
+    const payload = "userauth payload";
+
+    const signature_blob = try create_ed25519_auth_signature_blob(allocator, payload, &kp.private_key);
+    defer allocator.free(signature_blob);
+
+    const host_key_blob = try ssh_hostkey.encode_ed25519_host_key_blob(allocator, &kp.public_key);
+    defer allocator.free(host_key_blob);
+
+    try verify_ed25519_auth_signature_with_host_key_blob(payload, signature_blob, host_key_blob);
+}
+
+test "auth signature verify with host key blob rejects malformed blob" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(101);
+    const kp = ssh_signature.KeyPair.generate(prng.random());
+
+    const signature_blob = try create_ed25519_auth_signature_blob(allocator, "payload", &kp.private_key);
+    defer allocator.free(signature_blob);
+
+    const host_key_blob = try ssh_hostkey.encode_ed25519_host_key_blob(allocator, &kp.public_key);
+    defer allocator.free(host_key_blob);
+
+    const padded = try allocator.alloc(u8, host_key_blob.len + 1);
+    defer allocator.free(padded);
+    @memcpy(padded[0..host_key_blob.len], host_key_blob);
+    padded[padded.len - 1] = 0x01;
+
+    try std.testing.expectError(
+        error.HostKeyBlobMalformed,
+        verify_ed25519_auth_signature_with_host_key_blob("payload", signature_blob, padded),
+    );
+}
+
+test "auth signature verify with host key blob rejects algorithm mismatch" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(202);
+    const kp = ssh_signature.KeyPair.generate(prng.random());
+
+    const signature_blob = try create_ed25519_auth_signature_blob(allocator, "payload", &kp.private_key);
+    defer allocator.free(signature_blob);
+
+    const bad_host_key_blob = try allocator.alloc(u8, 4 + 7 + 4 + 32);
+    defer allocator.free(bad_host_key_blob);
+
+    var offset: usize = 0;
+    std.mem.writeInt(u32, bad_host_key_blob[offset..][0..4], 7, .big);
+    offset += 4;
+    @memcpy(bad_host_key_blob[offset .. offset + 7], "ssh-rsa");
+    offset += 7;
+    std.mem.writeInt(u32, bad_host_key_blob[offset..][0..4], 32, .big);
+    offset += 4;
+    @memcpy(bad_host_key_blob[offset .. offset + 32], &kp.public_key);
+
+    try std.testing.expectError(
+        error.HostKeyAlgorithmMismatch,
+        verify_ed25519_auth_signature_with_host_key_blob("payload", signature_blob, bad_host_key_blob),
     );
 }
 
