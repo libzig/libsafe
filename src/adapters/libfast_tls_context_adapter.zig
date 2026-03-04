@@ -405,3 +405,72 @@ test "adapter maps duplicate ALPN extensions during process server hello" {
 
     try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
 }
+
+test "adapter maps duplicate transport parameter extensions during process server hello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = server_tp_encoded },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = server_tp_encoded },
+    };
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
+}
+
+test "adapter enforces single-use handshake transitions" {
+    const allocator = std.testing.allocator;
+
+    var client_adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer client_adapter.deinit();
+    var server_adapter = LibfastTlsContextAdapter.init(allocator, .server);
+    defer server_adapter.deinit();
+
+    var client_engine = client_adapter.asEngine();
+    var server_engine = server_adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const client_hello = try client_engine.beginClientHandshake("example.com", &offered, client_tp_encoded);
+    defer client_engine.freeBuffer(client_hello);
+
+    try std.testing.expectError(
+        error.InvalidState,
+        client_engine.beginClientHandshake("example.com", &offered, client_tp_encoded),
+    );
+
+    const server_hello = try server_engine.buildServerHello(client_hello, &offered, server_tp_encoded);
+    defer server_engine.freeBuffer(server_hello);
+
+    try std.testing.expectError(
+        error.InvalidState,
+        server_engine.buildServerHello(client_hello, &offered, server_tp_encoded),
+    );
+
+    try client_engine.processServerHello(server_hello);
+    try std.testing.expectError(error.InvalidState, client_engine.processServerHello(server_hello));
+
+    try client_engine.completeHandshake("shared-secret");
+    try server_engine.completeHandshake("shared-secret");
+    try std.testing.expectError(error.InvalidState, client_engine.completeHandshake("shared-secret"));
+}
