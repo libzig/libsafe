@@ -215,6 +215,42 @@ test "derive updated traffic secrets is deterministic and generation scoped" {
     try std.testing.expect(!std.mem.eql(u8, &g1a.server_to_client, &g2.server_to_client));
 }
 
+test "derive updated traffic secrets separates contexts" {
+    var current = RekeyTrafficSecrets{
+        .client_to_server = [_]u8{0x9C} ** 32,
+        .server_to_client = [_]u8{0x3D} ** 32,
+    };
+    defer current.zeroize();
+
+    var app = derive_updated_traffic_secrets(&current, .application, 5);
+    defer app.zeroize();
+    var hs = derive_updated_traffic_secrets(&current, .handshake, 5);
+    defer hs.zeroize();
+    var upd = derive_updated_traffic_secrets(&current, .update, 5);
+    defer upd.zeroize();
+
+    try std.testing.expect(!std.mem.eql(u8, &app.client_to_server, &hs.client_to_server));
+    try std.testing.expect(!std.mem.eql(u8, &app.client_to_server, &upd.client_to_server));
+    try std.testing.expect(!std.mem.eql(u8, &hs.server_to_client, &upd.server_to_client));
+}
+
+test "derive updated traffic secrets does not mutate source secrets" {
+    var current = RekeyTrafficSecrets{
+        .client_to_server = [_]u8{0xA7} ** 32,
+        .server_to_client = [_]u8{0xB8} ** 32,
+    };
+    defer current.zeroize();
+
+    const before_client = current.client_to_server;
+    const before_server = current.server_to_client;
+
+    var next = derive_updated_traffic_secrets(&current, .application, 9);
+    defer next.zeroize();
+
+    try std.testing.expectEqualSlices(u8, &before_client, &current.client_to_server);
+    try std.testing.expectEqualSlices(u8, &before_server, &current.server_to_client);
+}
+
 test "owned secret buffer stores independent copy" {
     const allocator = std.testing.allocator;
     var source = [_]u8{ 1, 2, 3, 4 };
