@@ -900,3 +900,67 @@ test "complete handshake unsupported cipher returns error without state change" 
     try std.testing.expectError(error.UnsupportedCipherSuite, ctx.completeHandshake("shared-secret"));
     try std.testing.expectEqual(HandshakeState.server_hello_received, ctx.state);
 }
+
+test "complete handshake derives sha256 secrets and marks complete" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &[_]u8{ 0x00, 0x03, 0x02, 'h', '3' },
+        },
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = server_tp_encoded,
+        },
+    };
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try ctx.processServerHello(sh);
+    try ctx.completeHandshake("shared-secret");
+
+    try std.testing.expectEqual(HandshakeState.handshake_complete, ctx.state);
+    try std.testing.expect(ctx.key_schedule != null);
+    try std.testing.expectEqual(key_schedule_mod.HashAlgorithm.sha256, ctx.key_schedule.?.hash_alg);
+    try std.testing.expectEqual(@as(usize, 32), ctx.handshake_client_secret.?.len);
+    try std.testing.expectEqual(@as(usize, 32), ctx.handshake_server_secret.?.len);
+    try std.testing.expectEqual(@as(usize, 32), ctx.application_client_secret.?.len);
+    try std.testing.expectEqual(@as(usize, 32), ctx.application_server_secret.?.len);
+}
+
+test "complete handshake uses sha384 schedule for aes256 suite" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    ctx.state = .server_hello_received;
+    ctx.cipher_suite = handshake_mod.TLS_AES_256_GCM_SHA384;
+    try ctx.transcript.appendSlice(allocator, "transcript");
+
+    try ctx.completeHandshake("shared-secret");
+
+    try std.testing.expectEqual(HandshakeState.handshake_complete, ctx.state);
+    try std.testing.expect(ctx.key_schedule != null);
+    try std.testing.expectEqual(key_schedule_mod.HashAlgorithm.sha384, ctx.key_schedule.?.hash_alg);
+    try std.testing.expectEqual(@as(usize, 48), ctx.handshake_client_secret.?.len);
+    try std.testing.expectEqual(@as(usize, 48), ctx.handshake_server_secret.?.len);
+    try std.testing.expectEqual(@as(usize, 48), ctx.application_client_secret.?.len);
+    try std.testing.expectEqual(@as(usize, 48), ctx.application_server_secret.?.len);
+}
