@@ -1017,3 +1017,70 @@ test "process server hello succeeds without ALPN when none offered" {
     const peer_tp = ctx.getPeerTransportParams() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, server_tp_encoded, peer_tp);
 }
+
+test "verify finished data accepts matching verify_data" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    var ks = try key_schedule_mod.KeySchedule.init(allocator, .sha256);
+    defer ks.deinit();
+    ks.updateTranscript("transcript-bytes");
+
+    const server_handshake_secret = [_]u8{0x5A} ** 32;
+
+    var finished_key: [32]u8 = undefined;
+    defer @memset(&finished_key, 0);
+    try keys_mod.hkdfExpandLabel(
+        &server_handshake_secret,
+        "finished",
+        "",
+        finished_key.len,
+        .sha256,
+        &finished_key,
+    );
+
+    var verify_data: [32]u8 = undefined;
+    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&finished_key);
+    hmac.update(ks.transcript_hash);
+    hmac.final(&verify_data);
+
+    try ctx.verifyFinishedData(&ks, &server_handshake_secret, &verify_data);
+}
+
+test "verify finished data rejects wrong length" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    var ks = try key_schedule_mod.KeySchedule.init(allocator, .sha256);
+    defer ks.deinit();
+    ks.updateTranscript("transcript-bytes");
+
+    const server_handshake_secret = [_]u8{0x7B} ** 32;
+    const short_verify = [_]u8{0x01} ** 31;
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        ctx.verifyFinishedData(&ks, &server_handshake_secret, &short_verify),
+    );
+}
+
+test "verify finished data rejects mismatched payload" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    var ks = try key_schedule_mod.KeySchedule.init(allocator, .sha256);
+    defer ks.deinit();
+    ks.updateTranscript("transcript-bytes");
+
+    const server_handshake_secret = [_]u8{0x11} ** 32;
+    const wrong_verify = [_]u8{0x22} ** 32;
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        ctx.verifyFinishedData(&ks, &server_handshake_secret, &wrong_verify),
+    );
+}
