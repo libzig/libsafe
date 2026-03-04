@@ -1,5 +1,6 @@
 const std = @import("std");
 const tls_extensions = @import("extensions.zig");
+const tls_finished = @import("finished.zig");
 const handshake_mod = @import("handshake.zig");
 const key_schedule_mod = @import("key_schedule.zig");
 const tls_diag = @import("diagnostics.zig");
@@ -345,42 +346,7 @@ pub const TlsContext = struct {
         server_handshake_secret: []const u8,
         peer_verify_data: []const u8,
     ) TlsError!void {
-        const hash_len = ks.hash_alg.digestLength();
-        if (peer_verify_data.len != hash_len) return error.HandshakeFailed;
-
-        const finished_key = try self.allocator.alloc(u8, hash_len);
-        defer {
-            @memset(finished_key, 0);
-            self.allocator.free(finished_key);
-        }
-
-        keys_mod.hkdfExpandLabel(server_handshake_secret, "finished", "", hash_len, ks.hash_alg, finished_key) catch return error.HandshakeFailed;
-
-        const expected_verify_data = try self.allocator.alloc(u8, hash_len);
-        defer {
-            @memset(expected_verify_data, 0);
-            self.allocator.free(expected_verify_data);
-        }
-
-        switch (ks.hash_alg) {
-            .sha256 => {
-                var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(finished_key);
-                hmac.update(ks.transcript_hash);
-                hmac.final(expected_verify_data[0..32]);
-            },
-            .sha384 => {
-                var hmac = std.crypto.auth.hmac.sha2.HmacSha384.init(finished_key);
-                hmac.update(ks.transcript_hash);
-                hmac.final(expected_verify_data[0..48]);
-            },
-            .sha512 => {
-                var hmac = std.crypto.auth.hmac.sha2.HmacSha512.init(finished_key);
-                hmac.update(ks.transcript_hash);
-                hmac.final(expected_verify_data[0..64]);
-            },
-        }
-
-        if (!std.mem.eql(u8, peer_verify_data, expected_verify_data)) return error.HandshakeFailed;
+        tls_finished.verify_finished_data(self.allocator, ks, server_handshake_secret, peer_verify_data) catch return error.HandshakeFailed;
     }
 
     fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
