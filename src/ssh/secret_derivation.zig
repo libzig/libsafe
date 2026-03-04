@@ -125,6 +125,37 @@ pub fn deriveSshQuicSecrets(
     return secrets;
 }
 
+/// Derive a deterministic exporter secret for SSH-over-QUIC subprotocol keying.
+///
+/// The output is fixed at 32 bytes:
+/// exporter = HMAC-SHA256(secret_data, "ssh/quic exporter" || string(label) || string(context))
+/// where secret_data = mpint(K) || string(H).
+pub fn deriveSshQuicExporterSecret(
+    allocator: std.mem.Allocator,
+    shared_secret_k: []const u8,
+    exchange_hash_h: []const u8,
+    label: []const u8,
+    context: []const u8,
+) DerivationError![32]u8 {
+    const secret_data = try encodeSshSecretData(allocator, shared_secret_k, exchange_hash_h);
+    defer {
+        @memset(secret_data, 0);
+        allocator.free(secret_data);
+    }
+
+    const message = try encodeExporterMessage(allocator, label, context);
+    defer {
+        @memset(message, 0);
+        allocator.free(message);
+    }
+
+    var out: [32]u8 = undefined;
+    var hmac = crypto.auth.hmac.sha2.HmacSha256.init(secret_data);
+    hmac.update(message);
+    hmac.final(&out);
+    return out;
+}
+
 fn encodeSshSecretData(
     allocator: std.mem.Allocator,
     shared_secret_k: []const u8,
@@ -149,6 +180,35 @@ fn encodeSshSecretData(
     const h_offset = 4 + k_len;
     std.mem.writeInt(u32, out[h_offset..][0..4], @intCast(h_len), .big);
     @memcpy(out[h_offset + 4 .. h_offset + 4 + h_len], exchange_hash_h);
+
+    return out;
+}
+
+fn encodeExporterMessage(
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    context: []const u8,
+) DerivationError![]u8 {
+    if (label.len > std.math.maxInt(u32)) return error.DerivationFailed;
+    if (context.len > std.math.maxInt(u32)) return error.DerivationFailed;
+
+    const prefix = "ssh/quic exporter";
+    const total_len = prefix.len + 4 + label.len + 4 + context.len;
+    const out = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(out);
+
+    var offset: usize = 0;
+    @memcpy(out[offset .. offset + prefix.len], prefix);
+    offset += prefix.len;
+
+    std.mem.writeInt(u32, out[offset..][0..4], @intCast(label.len), .big);
+    offset += 4;
+    @memcpy(out[offset .. offset + label.len], label);
+    offset += label.len;
+
+    std.mem.writeInt(u32, out[offset..][0..4], @intCast(context.len), .big);
+    offset += 4;
+    @memcpy(out[offset .. offset + context.len], context);
 
     return out;
 }
@@ -243,4 +303,40 @@ test "derive SSH QUIC secrets wire compatible" {
 
     try std.testing.expectEqualSlices(u8, &secrets.client_initial_secret, &repeat.client_initial_secret);
     try std.testing.expectEqualSlices(u8, &secrets.server_initial_secret, &repeat.server_initial_secret);
+}
+
+test "derive SSH QUIC exporter secret deterministic vector" {
+    const allocator = std.testing.allocator;
+    const shared_secret = "test_shared_secret_32_bytes_value!";
+    const exchange_hash = "test_exchange_hash_value_32_bytes!";
+
+    const exporter = try deriveSshQuicExporterSecret(
+        allocator,
+        shared_secret,
+        exchange_hash,
+        "agent@v1",
+        "channel/open",
+    );
+
+    const expected = [_]u8{
+        0xf7, 0x83, 0x24, 0x56, 0x8b, 0xf8, 0x6d, 0x67,
+        0xc2, 0xbc, 0xc4, 0xbd, 0x18, 0xe4, 0x92, 0x63,
+        0x44, 0x94, 0xe1, 0x4c, 0x8f, 0xa5, 0xa5, 0xcb,
+        0x14, 0x79, 0x9a, 0x5a, 0xeb, 0x26, 0xd6, 0x37,
+    };
+
+    try std.testing.expectEqualSlices(u8, &expected, &exporter);
+}
+
+test "derive SSH QUIC exporter secret varies by label and context" {
+    const allocator = std.testing.allocator;
+    const shared_secret = "test_shared_secret_32_bytes_value!";
+    const exchange_hash = "test_exchange_hash_value_32_bytes!";
+
+    const a = try deriveSshQuicExporterSecret(allocator, shared_secret, exchange_hash, "auth@v1", "ctx-a");
+    const b = try deriveSshQuicExporterSecret(allocator, shared_secret, exchange_hash, "auth@v2", "ctx-a");
+    const c = try deriveSshQuicExporterSecret(allocator, shared_secret, exchange_hash, "auth@v1", "ctx-b");
+
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+    try std.testing.expect(!std.mem.eql(u8, &a, &c));
 }
