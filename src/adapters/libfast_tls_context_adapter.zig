@@ -382,6 +382,9 @@ test "adapter maps invalid transport parameters during process server hello" {
     defer allocator.free(sh);
 
     try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+    try std.testing.expect(tls_engine.getSelectedAlpn() == null);
+    try std.testing.expect(tls_engine.getPeerTransportParams() == null);
 }
 
 test "adapter maps duplicate ALPN extensions during process server hello" {
@@ -404,6 +407,7 @@ test "adapter maps duplicate ALPN extensions during process server hello" {
     defer allocator.free(sh);
 
     try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
 }
 
 test "adapter maps duplicate transport parameter extensions during process server hello" {
@@ -429,6 +433,8 @@ test "adapter maps duplicate transport parameter extensions during process serve
     defer allocator.free(sh);
 
     try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+    try std.testing.expect(tls_engine.getPeerTransportParams() == null);
 }
 
 test "adapter enforces single-use handshake transitions" {
@@ -521,4 +527,30 @@ test "adapter maps zero length ALPN selection during process server hello" {
 
     try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
     try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+}
+
+test "adapter unsupported cipher does not mutate client hello state" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    const random: [32]u8 = [_]u8{0x22} ** 32;
+    const sh = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = 0xDEAD,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const encoded_sh = try sh.encode(allocator);
+    defer allocator.free(encoded_sh);
+
+    try std.testing.expectError(error.UnsupportedCipherSuite, tls_engine.processServerHello(encoded_sh));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+    try std.testing.expect(tls_engine.getSelectedAlpn() == null);
+    try std.testing.expect(tls_engine.getPeerTransportParams() == null);
 }
