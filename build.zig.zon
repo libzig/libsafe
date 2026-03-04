@@ -1,6 +1,6 @@
 .{
     .name = .libsafe,
-    .version = "0.0.6",
+    .version = "0.0.7",
     .fingerprint = 0x239374c34840c6b9,
     .minimum_zig_version = "0.16.0-dev.0",
     .dependencies = .{},

@@ -63,3 +63,26 @@ test "x25519 key exchange" {
 
     try std.testing.expectEqualSlices(u8, &alice_shared, &bob_shared);
 }
+
+test "x25519 from_private_key derives deterministic public key" {
+    const private_key = [_]u8{0x42} ** private_key_size;
+
+    const a = try KeyPair.from_private_key(private_key);
+    const b = try KeyPair.from_private_key(private_key);
+
+    try std.testing.expectEqualSlices(u8, &a.public_key, &b.public_key);
+    try std.testing.expectEqualSlices(u8, &private_key, &a.private_key);
+}
+
+test "x25519 exchange is deterministic for fixed inputs" {
+    const alice_priv = [_]u8{0x11} ** private_key_size;
+    const bob_priv = [_]u8{0x22} ** private_key_size;
+
+    const alice = try KeyPair.from_private_key(alice_priv);
+    const bob = try KeyPair.from_private_key(bob_priv);
+
+    const shared_1 = try exchange(&alice.private_key, &bob.public_key);
+    const shared_2 = try exchange(&alice.private_key, &bob.public_key);
+
+    try std.testing.expectEqualSlices(u8, &shared_1, &shared_2);
+}

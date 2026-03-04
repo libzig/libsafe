@@ -151,3 +151,159 @@ test "key schedule basic derivation" {
 
     try std.testing.expectEqual(@as(usize, 32), ms.len);
 }
+
+test "key schedule transcript update is deterministic" {
+    const allocator = std.testing.allocator;
+
+    var a = try KeySchedule.init(allocator, .sha256);
+    defer a.deinit();
+    var b = try KeySchedule.init(allocator, .sha256);
+    defer b.deinit();
+
+    a.updateTranscript("client-hello");
+    a.updateTranscript("server-hello");
+
+    b.updateTranscript("client-hello");
+    b.updateTranscript("server-hello");
+
+    try std.testing.expectEqualSlices(u8, a.transcript_hash, b.transcript_hash);
+}
+
+test "key schedule derives expected secret lengths for hash variants" {
+    const allocator = std.testing.allocator;
+
+    const variants = [_]HashAlgorithm{ .sha256, .sha384, .sha512 };
+    for (variants) |hash_alg| {
+        var ks = try KeySchedule.init(allocator, hash_alg);
+        defer ks.deinit();
+
+        const early = try ks.deriveEarlySecret(null);
+        defer allocator.free(early);
+        const hs = try ks.deriveHandshakeSecret(early, "shared");
+        defer allocator.free(hs);
+        const ms = try ks.deriveMasterSecret(hs);
+        defer allocator.free(ms);
+
+        const expected_len = hash_alg.digestLength();
+        try std.testing.expectEqual(expected_len, early.len);
+        try std.testing.expectEqual(expected_len, hs.len);
+        try std.testing.expectEqual(expected_len, ms.len);
+    }
+}
+
+test "key schedule traffic secrets depend on transcript" {
+    const allocator = std.testing.allocator;
+
+    var a = try KeySchedule.init(allocator, .sha256);
+    defer a.deinit();
+    var b = try KeySchedule.init(allocator, .sha256);
+    defer b.deinit();
+
+    const early_a = try a.deriveEarlySecret(null);
+    defer allocator.free(early_a);
+    const hs_a = try a.deriveHandshakeSecret(early_a, "shared");
+    defer allocator.free(hs_a);
+
+    const early_b = try b.deriveEarlySecret(null);
+    defer allocator.free(early_b);
+    const hs_b = try b.deriveHandshakeSecret(early_b, "shared");
+    defer allocator.free(hs_b);
+
+    a.updateTranscript("transcript-a");
+    b.updateTranscript("transcript-b");
+
+    const a_secrets = try a.deriveHandshakeTrafficSecrets(hs_a);
+    defer {
+        @memset(a_secrets.client, 0);
+        allocator.free(a_secrets.client);
+        @memset(a_secrets.server, 0);
+        allocator.free(a_secrets.server);
+    }
+
+    const b_secrets = try b.deriveHandshakeTrafficSecrets(hs_b);
+    defer {
+        @memset(b_secrets.client, 0);
+        allocator.free(b_secrets.client);
+        @memset(b_secrets.server, 0);
+        allocator.free(b_secrets.server);
+    }
+
+    try std.testing.expect(!std.mem.eql(u8, a_secrets.client, b_secrets.client));
+    try std.testing.expect(!std.mem.eql(u8, a_secrets.server, b_secrets.server));
+}
+
+test "key schedule early secret changes with psk" {
+    const allocator = std.testing.allocator;
+
+    var ks = try KeySchedule.init(allocator, .sha256);
+    defer ks.deinit();
+
+    const no_psk = try ks.deriveEarlySecret(null);
+    defer allocator.free(no_psk);
+
+    const with_psk = try ks.deriveEarlySecret("psk-material");
+    defer allocator.free(with_psk);
+
+    try std.testing.expect(!std.mem.eql(u8, no_psk, with_psk));
+}
+
+test "key schedule traffic secret derivation is deterministic" {
+    const allocator = std.testing.allocator;
+
+    var a = try KeySchedule.init(allocator, .sha256);
+    defer a.deinit();
+    var b = try KeySchedule.init(allocator, .sha256);
+    defer b.deinit();
+
+    const early_a = try a.deriveEarlySecret("psk");
+    defer allocator.free(early_a);
+    const hs_a = try a.deriveHandshakeSecret(early_a, "shared");
+    defer allocator.free(hs_a);
+    const ms_a = try a.deriveMasterSecret(hs_a);
+    defer allocator.free(ms_a);
+
+    const early_b = try b.deriveEarlySecret("psk");
+    defer allocator.free(early_b);
+    const hs_b = try b.deriveHandshakeSecret(early_b, "shared");
+    defer allocator.free(hs_b);
+    const ms_b = try b.deriveMasterSecret(hs_b);
+    defer allocator.free(ms_b);
+
+    a.updateTranscript("same-transcript");
+    b.updateTranscript("same-transcript");
+
+    const hs_secrets_a = try a.deriveHandshakeTrafficSecrets(hs_a);
+    defer {
+        @memset(hs_secrets_a.client, 0);
+        allocator.free(hs_secrets_a.client);
+        @memset(hs_secrets_a.server, 0);
+        allocator.free(hs_secrets_a.server);
+    }
+    const hs_secrets_b = try b.deriveHandshakeTrafficSecrets(hs_b);
+    defer {
+        @memset(hs_secrets_b.client, 0);
+        allocator.free(hs_secrets_b.client);
+        @memset(hs_secrets_b.server, 0);
+        allocator.free(hs_secrets_b.server);
+    }
+
+    const app_secrets_a = try a.deriveApplicationTrafficSecrets(ms_a);
+    defer {
+        @memset(app_secrets_a.client, 0);
+        allocator.free(app_secrets_a.client);
+        @memset(app_secrets_a.server, 0);
+        allocator.free(app_secrets_a.server);
+    }
+    const app_secrets_b = try b.deriveApplicationTrafficSecrets(ms_b);
+    defer {
+        @memset(app_secrets_b.client, 0);
+        allocator.free(app_secrets_b.client);
+        @memset(app_secrets_b.server, 0);
+        allocator.free(app_secrets_b.server);
+    }
+
+    try std.testing.expectEqualSlices(u8, hs_secrets_a.client, hs_secrets_b.client);
+    try std.testing.expectEqualSlices(u8, hs_secrets_a.server, hs_secrets_b.server);
+    try std.testing.expectEqualSlices(u8, app_secrets_a.client, app_secrets_b.client);
+    try std.testing.expectEqualSlices(u8, app_secrets_a.server, app_secrets_b.server);
+}
