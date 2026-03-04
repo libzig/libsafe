@@ -16,6 +16,9 @@ pub const tls_context = @import("tls/tls_context.zig");
 pub const ssh_obfuscation = @import("ssh/obfuscation.zig");
 pub const ssh_kex = @import("ssh/kex_methods.zig");
 pub const ssh_secrets = @import("ssh/secret_derivation.zig");
+pub const ssh_ecdh = @import("ssh/ecdh.zig");
+pub const ssh_signature = @import("ssh/signature.zig");
+pub const ssh_hostkey = @import("ssh/hostkey.zig");
 
 test {
     std.testing.refAllDecls(@This());
