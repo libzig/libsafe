@@ -1,5 +1,6 @@
 const std = @import("std");
 const engine = @import("../engine.zig");
+const handshake_mod = @import("../tls/handshake.zig");
 const tls_context_mod = @import("../tls/tls_context.zig");
 
 pub const LibfastTlsContextAdapter = struct {
@@ -150,4 +151,74 @@ test "adapter begins client handshake" {
 
     try std.testing.expect(client_hello.len > 0);
     try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+}
+
+test "adapter maps invalid state from processServerHello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    try std.testing.expectError(error.InvalidState, tls_engine.processServerHello("not-started"));
+}
+
+test "adapter maps malformed server hello to handshake failed" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const client_hello = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(client_hello);
+
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello("bad-server-hello"));
+}
+
+test "adapter maps unsupported cipher suite from server hello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const client_hello = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(client_hello);
+
+    const random: [32]u8 = [_]u8{0x44} ** 32;
+    const sh = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = 0xFFFF,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const encoded_sh = try sh.encode(allocator);
+    defer allocator.free(encoded_sh);
+
+    try std.testing.expectError(error.UnsupportedCipherSuite, tls_engine.processServerHello(encoded_sh));
+}
+
+test "adapter maps ALPN mismatch during server hello build" {
+    const allocator = std.testing.allocator;
+
+    var client_adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer client_adapter.deinit();
+    var server_adapter = LibfastTlsContextAdapter.init(allocator, .server);
+    defer server_adapter.deinit();
+
+    var client_engine = client_adapter.asEngine();
+    var server_engine = server_adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const unsupported_on_server = [_][]const u8{"h2"};
+
+    const client_hello = try client_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer client_engine.freeBuffer(client_hello);
+
+    try std.testing.expectError(
+        error.AlpnMismatch,
+        server_engine.buildServerHello(client_hello, &unsupported_on_server, &[_]u8{}),
+    );
 }
