@@ -15,6 +15,7 @@ pub const tls_contract = @import("tls/contract.zig");
 pub const tls_extensions = @import("tls/extensions.zig");
 pub const tls_finished = @import("tls/finished.zig");
 pub const tls_interop = @import("tls/interop.zig");
+pub const tls_matrix = @import("tls/matrix.zig");
 pub const tls_policy = @import("tls/policy.zig");
 pub const tls_key_schedule = @import("tls/key_schedule.zig");
 pub const tls_context = @import("tls/tls_context.zig");
