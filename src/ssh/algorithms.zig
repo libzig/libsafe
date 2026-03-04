@@ -131,3 +131,28 @@ test "preferred selection ignores disabled algorithms" {
     const selected_sig = try select_preferred_signature_algorithm(&client, &server);
     try std.testing.expectEqual(SignatureAlgorithm.ssh_ed25519, selected_sig);
 }
+
+test "preferred selection rejects when only disabled overlap exists" {
+    const client = [_][]const u8{ "rsa-sha2-256", "rsa-sha2-512" };
+    const server = [_][]const u8{ "rsa-sha2-512", "rsa-sha2-256" };
+
+    try std.testing.expectError(
+        error.UnsupportedAlgorithm,
+        select_preferred_host_key_algorithm(&client, &server),
+    );
+    try std.testing.expectError(
+        error.UnsupportedAlgorithm,
+        select_preferred_signature_algorithm(&client, &server),
+    );
+}
+
+test "preferred selection skips unknown names and keeps deterministic order" {
+    const client = [_][]const u8{ "unknown-a", "ssh-ed25519", "unknown-b" };
+    const server = [_][]const u8{ "unknown-b", "ssh-ed25519" };
+
+    const selected_host = try select_preferred_host_key_algorithm(&client, &server);
+    const selected_sig = try select_preferred_signature_algorithm(&client, &server);
+
+    try std.testing.expectEqual(HostKeyAlgorithm.ssh_ed25519, selected_host);
+    try std.testing.expectEqual(SignatureAlgorithm.ssh_ed25519, selected_sig);
+}
