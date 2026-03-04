@@ -441,3 +441,16 @@ test "encode canonical positive mpint rejects oversized input" {
 
     try std.testing.expectError(error.InputTooLarge, encodeCanonicalPositiveMpint(allocator, oversized));
 }
+
+test "quic secrets zeroize clears both directions" {
+    var secrets = QuicSecrets{
+        .client_initial_secret = [_]u8{0xAA} ** 32,
+        .server_initial_secret = [_]u8{0x55} ** 32,
+        .hash_algorithm = .sha256,
+    };
+
+    secrets.zeroize();
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 32, &secrets.client_initial_secret);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 32, &secrets.server_initial_secret);
+}

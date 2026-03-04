@@ -146,3 +146,22 @@ test "owned secret buffer stores independent copy" {
     source[0] = 9;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, owned.as_slice());
 }
+
+test "rekey traffic secrets zeroize clears both directions" {
+    var secrets = RekeyTrafficSecrets{
+        .client_to_server = [_]u8{0x11} ** 32,
+        .server_to_client = [_]u8{0x22} ** 32,
+    };
+
+    secrets.zeroize();
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 32, &secrets.client_to_server);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 32, &secrets.server_to_client);
+}
+
+test "owned secret buffer deinit resets slice" {
+    const allocator = std.testing.allocator;
+    var owned = try OwnedSecretBuffer.init_copy(allocator, &[_]u8{ 9, 8, 7 });
+    owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owned.as_slice().len);
+}
