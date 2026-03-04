@@ -1,4 +1,5 @@
 const std = @import("std");
+const tls_extensions = @import("extensions.zig");
 const handshake_mod = @import("handshake.zig");
 const key_schedule_mod = @import("key_schedule.zig");
 const tls_diag = @import("diagnostics.zig");
@@ -287,11 +288,11 @@ pub const TlsContext = struct {
     }
 
     pub fn selectServerAlpn(offered_alpn_wire: []const u8, server_supported: []const []const u8) TlsError![]const u8 {
-        try validateAlpnListWire(offered_alpn_wire);
+        tls_extensions.validate_alpn_list_wire(offered_alpn_wire) catch return error.HandshakeFailed;
 
         for (server_supported) |candidate| {
             if (candidate.len == 0) continue;
-            if (isAlpnInOffer(offered_alpn_wire, candidate)) return candidate;
+            if (tls_extensions.offered_alpn_contains(offered_alpn_wire, candidate)) return candidate;
         }
         return error.AlpnMismatch;
     }
@@ -385,13 +386,8 @@ pub const TlsContext = struct {
     fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
         const alpn_data_opt = handshake_mod.findUniqueExtension(extensions, @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation)) catch return error.HandshakeFailed;
         const alpn_data = alpn_data_opt orelse return;
-        try validateAlpnListWire(alpn_data);
-
-        const name_len: usize = alpn_data[2];
-        if (name_len == 0) return error.HandshakeFailed;
-        if (3 + name_len != alpn_data.len) return error.HandshakeFailed;
-
-        const selected = try self.allocator.dupe(u8, alpn_data[3 .. 3 + name_len]);
+        const selected_slice = tls_extensions.parse_selected_alpn(alpn_data) catch return error.HandshakeFailed;
+        const selected = try self.allocator.dupe(u8, selected_slice);
         if (self.selected_alpn) |old| self.allocator.free(old);
         self.selected_alpn = selected;
     }
@@ -399,7 +395,7 @@ pub const TlsContext = struct {
     fn verifySelectedAlpnAgainstOffer(self: *TlsContext) TlsError!void {
         const offered = self.offered_alpn orelse return;
         const selected = self.selected_alpn orelse return error.HandshakeFailed;
-        if (!isAlpnInOffer(offered, selected)) return error.AlpnMismatch;
+        if (!tls_extensions.offered_alpn_contains(offered, selected)) return error.AlpnMismatch;
     }
 
     fn maybeStorePeerTransportParams(self: *TlsContext, extensions: []const u8) TlsError!void {
@@ -410,28 +406,6 @@ pub const TlsContext = struct {
         const copied = try self.allocator.dupe(u8, tp_data);
         if (self.peer_transport_params) |old| self.allocator.free(old);
         self.peer_transport_params = copied;
-    }
-
-    fn isAlpnInOffer(offered_wire: []const u8, selected: []const u8) bool {
-        validateAlpnListWire(offered_wire) catch return false;
-
-        var pos: usize = 2;
-        while (pos < offered_wire.len) {
-            const protocol_len = offered_wire[pos];
-            pos += 1;
-            if (protocol_len == 0) return false;
-            if (pos + protocol_len > offered_wire.len) return false;
-            if (std.mem.eql(u8, offered_wire[pos .. pos + protocol_len], selected)) return true;
-            pos += protocol_len;
-        }
-
-        return false;
-    }
-
-    fn validateAlpnListWire(alpn_wire: []const u8) TlsError!void {
-        if (alpn_wire.len < 2) return error.HandshakeFailed;
-        const list_len: usize = (@as(usize, alpn_wire[0]) << 8) | alpn_wire[1];
-        if (list_len + 2 != alpn_wire.len) return error.HandshakeFailed;
     }
 
     fn selectServerCipherSuite(offered_cipher_suites: []const u8) ?u16 {
@@ -1135,9 +1109,9 @@ test "tls hash algorithm mapping follows cipher suite" {
 }
 
 test "validate ALPN list wire guards malformed lengths" {
-    try std.testing.expectError(error.HandshakeFailed, TlsContext.validateAlpnListWire(&[_]u8{0x00}));
-    try std.testing.expectError(error.HandshakeFailed, TlsContext.validateAlpnListWire(&[_]u8{ 0x00, 0x02, 0x01 }));
-    try TlsContext.validateAlpnListWire(&[_]u8{ 0x00, 0x02, 0x01, 'h' });
+    try std.testing.expectError(error.InvalidAlpnWire, tls_extensions.validate_alpn_list_wire(&[_]u8{0x00}));
+    try std.testing.expectError(error.InvalidAlpnWire, tls_extensions.validate_alpn_list_wire(&[_]u8{ 0x00, 0x02, 0x01 }));
+    try tls_extensions.validate_alpn_list_wire(&[_]u8{ 0x00, 0x02, 0x01, 'h' });
 }
 
 test "encode selected ALPN extension validates length bounds" {
