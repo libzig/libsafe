@@ -181,17 +181,8 @@ pub const TlsContext = struct {
         if (!self.is_client or self.state != .client_hello_sent) return error.InvalidState;
 
         const parsed = handshake_mod.parseServerHello(server_hello_data) catch return error.HandshakeFailed;
-        switch (parsed.cipher_suite) {
-            handshake_mod.TLS_AES_128_GCM_SHA256,
-            handshake_mod.TLS_AES_256_GCM_SHA384,
-            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
-            => self.cipher_suite = parsed.cipher_suite,
-            else => return error.UnsupportedCipherSuite,
-        }
-
-        try self.maybeStoreSelectedAlpn(parsed.extensions);
-        try self.verifySelectedAlpnAgainstOffer();
-        try self.maybeStorePeerTransportParams(parsed.extensions);
+        self.cipher_suite = try requireSupportedCipherSuite(parsed.cipher_suite);
+        try self.applyServerHelloExtensions(parsed.extensions);
         try self.transcript.appendSlice(self.allocator, server_hello_data);
         self.state = .server_hello_received;
     }
@@ -199,14 +190,17 @@ pub const TlsContext = struct {
     pub fn completeHandshake(self: *TlsContext, shared_secret: []const u8) TlsError!void {
         if (self.state != .server_hello_received) return error.InvalidState;
 
-        const hash_alg: key_schedule_mod.HashAlgorithm = switch (self.cipher_suite orelse handshake_mod.TLS_AES_128_GCM_SHA256) {
-            handshake_mod.TLS_AES_128_GCM_SHA256,
-            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
-            => .sha256,
-            handshake_mod.TLS_AES_256_GCM_SHA384 => .sha384,
-            else => return error.UnsupportedCipherSuite,
-        };
+        const hash_alg = try tlsHashAlgorithmForCipherSuite(self.cipher_suite orelse handshake_mod.TLS_AES_128_GCM_SHA256);
 
+        try self.deriveAndInstallTrafficSecrets(hash_alg, shared_secret);
+        self.state = .handshake_complete;
+    }
+
+    fn deriveAndInstallTrafficSecrets(
+        self: *TlsContext,
+        hash_alg: key_schedule_mod.HashAlgorithm,
+        shared_secret: []const u8,
+    ) TlsError!void {
         var ks = try key_schedule_mod.KeySchedule.init(self.allocator, hash_alg);
         errdefer ks.deinit();
 
@@ -244,7 +238,32 @@ pub const TlsContext = struct {
         const ks_ptr = try self.allocator.create(key_schedule_mod.KeySchedule);
         ks_ptr.* = ks;
         self.key_schedule = ks_ptr;
-        self.state = .handshake_complete;
+    }
+
+    fn tlsHashAlgorithmForCipherSuite(cipher_suite: u16) TlsError!key_schedule_mod.HashAlgorithm {
+        return switch (cipher_suite) {
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+            => .sha256,
+            handshake_mod.TLS_AES_256_GCM_SHA384 => .sha384,
+            else => error.UnsupportedCipherSuite,
+        };
+    }
+
+    fn applyServerHelloExtensions(self: *TlsContext, extensions: []const u8) TlsError!void {
+        try self.maybeStoreSelectedAlpn(extensions);
+        try self.verifySelectedAlpnAgainstOffer();
+        try self.maybeStorePeerTransportParams(extensions);
+    }
+
+    fn requireSupportedCipherSuite(cipher_suite: u16) TlsError!u16 {
+        return switch (cipher_suite) {
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_AES_256_GCM_SHA384,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+            => cipher_suite,
+            else => error.UnsupportedCipherSuite,
+        };
     }
 
     pub fn getSelectedAlpn(self: *const TlsContext) ?[]const u8 {
@@ -1100,6 +1119,22 @@ test "complete handshake uses sha384 schedule for aes256 suite" {
     try std.testing.expectEqual(@as(usize, 48), ctx.handshake_server_secret.?.len);
     try std.testing.expectEqual(@as(usize, 48), ctx.application_client_secret.?.len);
     try std.testing.expectEqual(@as(usize, 48), ctx.application_server_secret.?.len);
+}
+
+test "tls hash algorithm mapping follows cipher suite" {
+    try std.testing.expectEqual(
+        key_schedule_mod.HashAlgorithm.sha256,
+        try TlsContext.tlsHashAlgorithmForCipherSuite(handshake_mod.TLS_AES_128_GCM_SHA256),
+    );
+    try std.testing.expectEqual(
+        key_schedule_mod.HashAlgorithm.sha256,
+        try TlsContext.tlsHashAlgorithmForCipherSuite(handshake_mod.TLS_CHACHA20_POLY1305_SHA256),
+    );
+    try std.testing.expectEqual(
+        key_schedule_mod.HashAlgorithm.sha384,
+        try TlsContext.tlsHashAlgorithmForCipherSuite(handshake_mod.TLS_AES_256_GCM_SHA384),
+    );
+    try std.testing.expectError(error.UnsupportedCipherSuite, TlsContext.tlsHashAlgorithmForCipherSuite(0xDEAD));
 }
 
 test "encode selected ALPN extension validates length bounds" {
