@@ -888,6 +888,79 @@ test "build server hello unsupported cipher offer leaves server idle" {
     try std.testing.expect(server.getPeerTransportParams() == null);
 }
 
+test "build server hello rejects client hello without ALPN extension" {
+    const allocator = std.testing.allocator;
+
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const suites = [_]u16{handshake_mod.TLS_AES_128_GCM_SHA256};
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        .extension_data = client_tp_encoded,
+    }};
+    const ch = handshake_mod.ClientHello{
+        .random = [_]u8{0x21} ** 32,
+        .cipher_suites = &suites,
+        .extensions = &ext,
+    };
+    const ch_bytes = try ch.encode(allocator);
+    defer allocator.free(ch_bytes);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        server.buildServerHelloFromClientHello(ch_bytes, &supported, server_tp_encoded),
+    );
+    try std.testing.expectEqual(HandshakeState.idle, server.state);
+    try std.testing.expect(server.getSelectedAlpn() == null);
+    try std.testing.expect(server.getPeerTransportParams() == null);
+}
+
+test "build server hello rejects malformed client ALPN extension payload" {
+    const allocator = std.testing.allocator;
+
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const bad_alpn = [_]u8{ 0x00, 0x04, 0x02, 'h', '3' };
+    const suites = [_]u16{handshake_mod.TLS_AES_128_GCM_SHA256};
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &bad_alpn },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = client_tp_encoded },
+    };
+    const ch = handshake_mod.ClientHello{
+        .random = [_]u8{0x31} ** 32,
+        .cipher_suites = &suites,
+        .extensions = &ext,
+    };
+    const ch_bytes = try ch.encode(allocator);
+    defer allocator.free(ch_bytes);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        server.buildServerHelloFromClientHello(ch_bytes, &supported, server_tp_encoded),
+    );
+    try std.testing.expectEqual(HandshakeState.idle, server.state);
+}
+
 test "complete handshake unsupported cipher returns error without state change" {
     const allocator = std.testing.allocator;
 
