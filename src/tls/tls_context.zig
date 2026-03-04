@@ -964,3 +964,56 @@ test "complete handshake uses sha384 schedule for aes256 suite" {
     try std.testing.expectEqual(@as(usize, 48), ctx.application_client_secret.?.len);
     try std.testing.expectEqual(@as(usize, 48), ctx.application_server_secret.?.len);
 }
+
+test "encode selected ALPN extension validates length bounds" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.HandshakeFailed, TlsContext.encodeSelectedAlpnExtensionData(allocator, ""));
+
+    const oversized = try allocator.alloc(u8, 256);
+    defer allocator.free(oversized);
+    @memset(oversized, 'a');
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        TlsContext.encodeSelectedAlpnExtensionData(allocator, oversized),
+    );
+}
+
+test "select server ALPN follows server preference order" {
+    const offered_wire = [_]u8{ 0x00, 0x06, 0x02, 'h', '2', 0x02, 'h', '3' };
+    const server_prefers_h3 = [_][]const u8{ "h3", "h2" };
+    const selected = try TlsContext.selectServerAlpn(&offered_wire, &server_prefers_h3);
+    try std.testing.expectEqualStrings("h3", selected);
+}
+
+test "process server hello succeeds without ALPN when none offered" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &[_][]const u8{}, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        .extension_data = server_tp_encoded,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try ctx.processServerHello(sh);
+    try std.testing.expectEqual(HandshakeState.server_hello_received, ctx.state);
+    try std.testing.expect(ctx.getSelectedAlpn() == null);
+
+    const peer_tp = ctx.getPeerTransportParams() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, server_tp_encoded, peer_tp);
+}
