@@ -14,6 +14,7 @@ pub const tls_handshake = @import("tls/handshake.zig");
 pub const tls_key_schedule = @import("tls/key_schedule.zig");
 pub const tls_context = @import("tls/tls_context.zig");
 pub const tls_auth = @import("tls/auth.zig");
+pub const tls_diagnostics = @import("tls/diagnostics.zig");
 pub const ssh_obfuscation = @import("ssh/obfuscation.zig");
 pub const ssh_algorithms = @import("ssh/algorithms.zig");
 pub const ssh_kex = @import("ssh/kex_methods.zig");

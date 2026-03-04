@@ -1,6 +1,7 @@
 const std = @import("std");
 const handshake_mod = @import("handshake.zig");
 const key_schedule_mod = @import("key_schedule.zig");
+const tls_diag = @import("diagnostics.zig");
 const keys_mod = @import("../crypto/keys.zig");
 const transport_params_mod = @import("../core/transport_params.zig");
 
@@ -252,6 +253,18 @@ pub const TlsContext = struct {
 
     pub fn getPeerTransportParams(self: *const TlsContext) ?[]const u8 {
         return self.peer_transport_params;
+    }
+
+    pub fn diagnosticsSnapshot(self: *const TlsContext, last_error: ?[]const u8) tls_diag.HandshakeDiagnostics {
+        return tls_diag.build_handshake_diagnostics(
+            self.state,
+            self.cipher_suite,
+            self.selected_alpn,
+            self.peer_transport_params,
+            last_error,
+            self.handshake_client_secret,
+            self.application_client_secret,
+        );
     }
 
     pub fn selectServerAlpn(offered_alpn_wire: []const u8, server_supported: []const []const u8) TlsError![]const u8 {
@@ -1177,6 +1190,28 @@ test "process server hello accepts out of order ALPN and transport extensions" {
     try std.testing.expectEqual(HandshakeState.server_hello_received, client.state);
     try std.testing.expectEqualStrings("h3", client.getSelectedAlpn().?);
     try std.testing.expectEqualSlices(u8, server_tp_encoded, client.getPeerTransportParams().?);
+}
+
+test "tls context diagnostics snapshot redacts secrets and reports state" {
+    const allocator = std.testing.allocator;
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    ctx.state = .server_hello_received;
+    ctx.cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256;
+    ctx.selected_alpn = try allocator.dupe(u8, "h3");
+    ctx.peer_transport_params = try allocator.dupe(u8, "tp");
+    ctx.handshake_client_secret = try allocator.dupe(u8, "hs-secret");
+    ctx.application_client_secret = try allocator.dupe(u8, "app-secret");
+
+    const snap = ctx.diagnosticsSnapshot("alert");
+    try std.testing.expectEqual(HandshakeState.server_hello_received, snap.state);
+    try std.testing.expectEqual(@as(u16, handshake_mod.TLS_AES_128_GCM_SHA256), snap.cipher_suite.?);
+    try std.testing.expectEqualStrings("h3", snap.selected_alpn.?);
+    try std.testing.expectEqual(@as(usize, 2), snap.peer_transport_params_len.?);
+    try std.testing.expectEqualStrings("alert", snap.last_error.?);
+    try std.testing.expect(snap.handshake_secret_fingerprint != null);
+    try std.testing.expect(snap.application_secret_fingerprint != null);
 }
 
 test "verify finished data accepts matching verify_data" {
