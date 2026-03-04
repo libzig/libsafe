@@ -554,3 +554,42 @@ test "adapter unsupported cipher does not mutate client hello state" {
     try std.testing.expect(tls_engine.getSelectedAlpn() == null);
     try std.testing.expect(tls_engine.getPeerTransportParams() == null);
 }
+
+test "adapter malformed server hello failure is deterministic" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello("bad-server-hello"));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello("bad-server-hello"));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+}
+
+test "adapter malformed client hello build failure is deterministic" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .server);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const supported = [_][]const u8{"h3"};
+
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        tls_engine.buildServerHello("bad-client-hello", &supported, &[_]u8{}),
+    );
+    try std.testing.expectEqual(engine.HandshakeState.idle, tls_engine.state());
+
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        tls_engine.buildServerHello("bad-client-hello", &supported, &[_]u8{}),
+    );
+    try std.testing.expectEqual(engine.HandshakeState.idle, tls_engine.state());
+}
