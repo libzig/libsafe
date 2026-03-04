@@ -2,6 +2,7 @@ const std = @import("std");
 const engine = @import("../engine.zig");
 const handshake_mod = @import("../tls/handshake.zig");
 const tls_context_mod = @import("../tls/tls_context.zig");
+const transport_params_mod = @import("../core/transport_params.zig");
 
 pub const LibfastTlsContextAdapter = struct {
     allocator: std.mem.Allocator,
@@ -221,4 +222,61 @@ test "adapter maps ALPN mismatch during server hello build" {
         error.AlpnMismatch,
         server_engine.buildServerHello(client_hello, &unsupported_on_server, &[_]u8{}),
     );
+}
+
+test "adapter state transition matrix happy path" {
+    const allocator = std.testing.allocator;
+
+    var client_adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer client_adapter.deinit();
+    var server_adapter = LibfastTlsContextAdapter.init(allocator, .server);
+    defer server_adapter.deinit();
+
+    var client_engine = client_adapter.asEngine();
+    var server_engine = server_adapter.asEngine();
+
+    try std.testing.expectEqual(engine.HandshakeState.idle, client_engine.state());
+    try std.testing.expectEqual(engine.HandshakeState.idle, server_engine.state());
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const client_hello = try client_engine.beginClientHandshake("example.com", &offered, client_tp_encoded);
+    defer client_engine.freeBuffer(client_hello);
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, client_engine.state());
+
+    const server_hello = try server_engine.buildServerHello(client_hello, &offered, server_tp_encoded);
+    defer server_engine.freeBuffer(server_hello);
+    try std.testing.expectEqual(engine.HandshakeState.server_hello_received, server_engine.state());
+
+    try client_engine.processServerHello(server_hello);
+    try std.testing.expectEqual(engine.HandshakeState.server_hello_received, client_engine.state());
+
+    try client_engine.completeHandshake("shared-secret");
+    try server_engine.completeHandshake("shared-secret");
+    try std.testing.expectEqual(engine.HandshakeState.handshake_complete, client_engine.state());
+    try std.testing.expectEqual(engine.HandshakeState.handshake_complete, server_engine.state());
+}
+
+test "adapter rejects invalid operation order" {
+    const allocator = std.testing.allocator;
+
+    var client_adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer client_adapter.deinit();
+    var server_adapter = LibfastTlsContextAdapter.init(allocator, .server);
+    defer server_adapter.deinit();
+
+    var client_engine = client_adapter.asEngine();
+    var server_engine = server_adapter.asEngine();
+
+    try std.testing.expectError(error.InvalidState, client_engine.completeHandshake("shared-secret"));
+    try std.testing.expectError(error.InvalidState, client_engine.buildServerHello("bad", &[_][]const u8{"h3"}, &[_]u8{}));
+    try std.testing.expectError(error.InvalidState, server_engine.beginClientHandshake("example.com", &[_][]const u8{"h3"}, &[_]u8{}));
+    try std.testing.expectError(error.InvalidState, server_engine.processServerHello("bad"));
 }
