@@ -1214,3 +1214,86 @@ test "build server hello chooses preferred cipher over client order" {
     try std.testing.expectEqual(handshake_mod.TLS_AES_128_GCM_SHA256, parsed.cipher_suite);
     try std.testing.expectEqual(HandshakeState.server_hello_received, server.state);
 }
+
+test "process server hello stores selected ALPN and transport params atomically" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &[_]u8{ 0x00, 0x03, 0x02, 'h', '3' },
+        },
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = server_tp_encoded,
+        },
+    };
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try client.processServerHello(sh);
+
+    const selected = client.getSelectedAlpn() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("h3", selected);
+    const peer_tp = client.getPeerTransportParams() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, server_tp_encoded, peer_tp);
+    try std.testing.expectEqual(HandshakeState.server_hello_received, client.state);
+}
+
+test "process server hello preserves previously stored fields on parse failure" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    client.selected_alpn = try allocator.dupe(u8, "h3");
+    client.peer_transport_params = try allocator.dupe(u8, server_tp_encoded);
+
+    const bad_tp = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+    const bad_ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &[_]u8{ 0x00, 0x03, 0x02, 'h', '3' },
+        },
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = &bad_tp,
+        },
+    };
+    const bad_sh = try makeServerHelloWithExtensions(allocator, &bad_ext);
+    defer allocator.free(bad_sh);
+
+    try std.testing.expectError(error.HandshakeFailed, client.processServerHello(bad_sh));
+    const retained_alpn = client.getSelectedAlpn() orelse return error.TestUnexpectedResult;
+    const retained_tp = client.getPeerTransportParams() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("h3", retained_alpn);
+    try std.testing.expectEqualSlices(u8, server_tp_encoded, retained_tp);
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, client.state);
+}
