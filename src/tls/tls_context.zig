@@ -1084,3 +1084,47 @@ test "verify finished data rejects mismatched payload" {
         ctx.verifyFinishedData(&ks, &server_handshake_secret, &wrong_verify),
     );
 }
+
+test "start client handshake rejects invalid local transport params" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const bad_tp = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        ctx.startClientHandshakeWithParams("example.com", &offered, &bad_tp),
+    );
+    try std.testing.expectEqual(HandshakeState.idle, ctx.state);
+    try std.testing.expect(ctx.getSelectedAlpn() == null);
+    try std.testing.expect(ctx.getPeerTransportParams() == null);
+}
+
+test "build server hello rejects invalid local transport params" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const bad_server_tp = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        server.buildServerHelloFromClientHello(ch, &offered, &bad_server_tp),
+    );
+    try std.testing.expectEqual(HandshakeState.idle, server.state);
+    try std.testing.expect(server.getSelectedAlpn() == null);
+    try std.testing.expect(server.getPeerTransportParams() == null);
+}
