@@ -847,3 +847,56 @@ test "build server hello ALPN mismatch does not mutate server state" {
     try std.testing.expect(server.getSelectedAlpn() == null);
     try std.testing.expect(server.getPeerTransportParams() == null);
 }
+
+test "build server hello unsupported cipher offer leaves server idle" {
+    const allocator = std.testing.allocator;
+
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    const suites = [_]u16{0x00FF};
+    const random: [32]u8 = [_]u8{0x11} ** 32;
+    const alpn_offer = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_offer },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = client_tp_encoded },
+    };
+    const ch = handshake_mod.ClientHello{
+        .random = random,
+        .cipher_suites = &suites,
+        .extensions = &ext,
+    };
+    const ch_bytes = try ch.encode(allocator);
+    defer allocator.free(ch_bytes);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(
+        error.UnsupportedCipherSuite,
+        server.buildServerHelloFromClientHello(ch_bytes, &supported, server_tp_encoded),
+    );
+    try std.testing.expectEqual(HandshakeState.idle, server.state);
+    try std.testing.expect(server.getSelectedAlpn() == null);
+    try std.testing.expect(server.getPeerTransportParams() == null);
+}
+
+test "complete handshake unsupported cipher returns error without state change" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    ctx.state = .server_hello_received;
+    ctx.cipher_suite = 0x9999;
+
+    try std.testing.expectError(error.UnsupportedCipherSuite, ctx.completeHandshake("shared-secret"));
+    try std.testing.expectEqual(HandshakeState.server_hello_received, ctx.state);
+}
