@@ -1174,3 +1174,43 @@ test "tls context invalid state matrix is stable" {
     );
     try std.testing.expectEqual(HandshakeState.client_hello_sent, client.state);
 }
+
+test "build server hello chooses preferred cipher over client order" {
+    const allocator = std.testing.allocator;
+
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const alpn_offer = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+    const suites = [_]u16{
+        handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+        handshake_mod.TLS_AES_128_GCM_SHA256,
+    };
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_offer },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = client_tp_encoded },
+    };
+    const ch = handshake_mod.ClientHello{
+        .random = [_]u8{0xA1} ** 32,
+        .cipher_suites = &suites,
+        .extensions = &ext,
+    };
+    const ch_bytes = try ch.encode(allocator);
+    defer allocator.free(ch_bytes);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const supported = [_][]const u8{"h3"};
+    const sh_bytes = try server.buildServerHelloFromClientHello(ch_bytes, &supported, server_tp_encoded);
+    defer allocator.free(sh_bytes);
+
+    const parsed = try handshake_mod.parseServerHello(sh_bytes);
+    try std.testing.expectEqual(handshake_mod.TLS_AES_128_GCM_SHA256, parsed.cipher_suite);
+    try std.testing.expectEqual(HandshakeState.server_hello_received, server.state);
+}
