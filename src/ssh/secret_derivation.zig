@@ -89,6 +89,70 @@ pub fn deriveQuicSecrets(
     return secrets;
 }
 
+/// Derive SSH/QUIC client and server secrets using the wire-compatible
+/// secret_data construction used by liblink.
+///
+/// secret_data = mpint(K) || string(H)
+/// client = HMAC-SHA256(secret_data, "ssh/quic client")
+/// server = HMAC-SHA256(secret_data, "ssh/quic server")
+pub fn deriveSshQuicSecrets(
+    allocator: std.mem.Allocator,
+    shared_secret_k: []const u8,
+    exchange_hash_h: []const u8,
+) DerivationError!QuicSecrets {
+    const secret_data = try encodeSshSecretData(allocator, shared_secret_k, exchange_hash_h);
+    defer {
+        @memset(secret_data, 0);
+        allocator.free(secret_data);
+    }
+
+    var secrets = QuicSecrets{
+        .client_initial_secret = undefined,
+        .server_initial_secret = undefined,
+        .hash_algorithm = .sha256,
+    };
+
+    const client_label = "ssh/quic client";
+    var client_hmac = crypto.auth.hmac.sha2.HmacSha256.init(secret_data);
+    client_hmac.update(client_label);
+    client_hmac.final(&secrets.client_initial_secret);
+
+    const server_label = "ssh/quic server";
+    var server_hmac = crypto.auth.hmac.sha2.HmacSha256.init(secret_data);
+    server_hmac.update(server_label);
+    server_hmac.final(&secrets.server_initial_secret);
+
+    return secrets;
+}
+
+fn encodeSshSecretData(
+    allocator: std.mem.Allocator,
+    shared_secret_k: []const u8,
+    exchange_hash_h: []const u8,
+) DerivationError![]u8 {
+    const k_needs_padding = shared_secret_k.len > 0 and (shared_secret_k[0] & 0x80) != 0;
+    const k_len = shared_secret_k.len + @as(usize, if (k_needs_padding) 1 else 0);
+    const h_len = exchange_hash_h.len;
+    const total_len = 4 + k_len + 4 + h_len;
+
+    const out = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(out);
+
+    std.mem.writeInt(u32, out[0..4], @intCast(k_len), .big);
+    if (k_needs_padding) {
+        out[4] = 0;
+        @memcpy(out[5 .. 5 + shared_secret_k.len], shared_secret_k);
+    } else {
+        @memcpy(out[4 .. 4 + shared_secret_k.len], shared_secret_k);
+    }
+
+    const h_offset = 4 + k_len;
+    std.mem.writeInt(u32, out[h_offset..][0..4], @intCast(h_len), .big);
+    @memcpy(out[h_offset + 4 .. h_offset + 4 + h_len], exchange_hash_h);
+
+    return out;
+}
+
 pub fn expandLabel(
     secret: []const u8,
     label: []const u8,
@@ -162,4 +226,21 @@ test "derive QUIC secrets from SSH key exchange" {
     var secrets = try deriveQuicSecrets(shared_secret, exchange_hash, .sha256);
     defer secrets.zeroize();
     try std.testing.expect(!std.mem.eql(u8, &secrets.client_initial_secret, &secrets.server_initial_secret));
+}
+
+test "derive SSH QUIC secrets wire compatible" {
+    const allocator = std.testing.allocator;
+    const shared_secret = "test_shared_secret_32_bytes_value!";
+    const exchange_hash = "test_exchange_hash_value_32_bytes!";
+
+    var secrets = try deriveSshQuicSecrets(allocator, shared_secret, exchange_hash);
+    defer secrets.zeroize();
+
+    try std.testing.expect(!std.mem.eql(u8, &secrets.client_initial_secret, &secrets.server_initial_secret));
+
+    var repeat = try deriveSshQuicSecrets(allocator, shared_secret, exchange_hash);
+    defer repeat.zeroize();
+
+    try std.testing.expectEqualSlices(u8, &secrets.client_initial_secret, &repeat.client_initial_secret);
+    try std.testing.expectEqualSlices(u8, &secrets.server_initial_secret, &repeat.server_initial_secret);
 }
