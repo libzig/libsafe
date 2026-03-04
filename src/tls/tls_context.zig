@@ -287,10 +287,7 @@ pub const TlsContext = struct {
     }
 
     pub fn selectServerAlpn(offered_alpn_wire: []const u8, server_supported: []const []const u8) TlsError![]const u8 {
-        if (offered_alpn_wire.len < 2) return error.HandshakeFailed;
-
-        const list_len: usize = (@as(usize, offered_alpn_wire[0]) << 8) | offered_alpn_wire[1];
-        if (list_len + 2 != offered_alpn_wire.len) return error.HandshakeFailed;
+        try validateAlpnListWire(offered_alpn_wire);
 
         for (server_supported) |candidate| {
             if (candidate.len == 0) continue;
@@ -388,10 +385,7 @@ pub const TlsContext = struct {
     fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
         const alpn_data_opt = handshake_mod.findUniqueExtension(extensions, @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation)) catch return error.HandshakeFailed;
         const alpn_data = alpn_data_opt orelse return;
-        if (alpn_data.len < 3) return error.HandshakeFailed;
-
-        const list_len: usize = (@as(usize, alpn_data[0]) << 8) | alpn_data[1];
-        if (list_len + 2 != alpn_data.len) return error.HandshakeFailed;
+        try validateAlpnListWire(alpn_data);
 
         const name_len: usize = alpn_data[2];
         if (name_len == 0) return error.HandshakeFailed;
@@ -419,10 +413,7 @@ pub const TlsContext = struct {
     }
 
     fn isAlpnInOffer(offered_wire: []const u8, selected: []const u8) bool {
-        if (offered_wire.len < 2) return false;
-
-        const list_len: usize = (@as(usize, offered_wire[0]) << 8) | offered_wire[1];
-        if (list_len + 2 != offered_wire.len) return false;
+        validateAlpnListWire(offered_wire) catch return false;
 
         var pos: usize = 2;
         while (pos < offered_wire.len) {
@@ -435,6 +426,12 @@ pub const TlsContext = struct {
         }
 
         return false;
+    }
+
+    fn validateAlpnListWire(alpn_wire: []const u8) TlsError!void {
+        if (alpn_wire.len < 2) return error.HandshakeFailed;
+        const list_len: usize = (@as(usize, alpn_wire[0]) << 8) | alpn_wire[1];
+        if (list_len + 2 != alpn_wire.len) return error.HandshakeFailed;
     }
 
     fn selectServerCipherSuite(offered_cipher_suites: []const u8) ?u16 {
@@ -1135,6 +1132,12 @@ test "tls hash algorithm mapping follows cipher suite" {
         try TlsContext.tlsHashAlgorithmForCipherSuite(handshake_mod.TLS_AES_256_GCM_SHA384),
     );
     try std.testing.expectError(error.UnsupportedCipherSuite, TlsContext.tlsHashAlgorithmForCipherSuite(0xDEAD));
+}
+
+test "validate ALPN list wire guards malformed lengths" {
+    try std.testing.expectError(error.HandshakeFailed, TlsContext.validateAlpnListWire(&[_]u8{0x00}));
+    try std.testing.expectError(error.HandshakeFailed, TlsContext.validateAlpnListWire(&[_]u8{ 0x00, 0x02, 0x01 }));
+    try TlsContext.validateAlpnListWire(&[_]u8{ 0x00, 0x02, 0x01, 'h' });
 }
 
 test "encode selected ALPN extension validates length bounds" {
