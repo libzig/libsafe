@@ -317,3 +317,27 @@ test "validate negotiated kex method rejects unsupported selection" {
         validate_negotiated_kex_method(&client_methods, &server_methods, "sntrup761x25519-sha512"),
     );
 }
+
+test "negotiate kex method rejects when no common supported method" {
+    const client_methods = [_][]const u8{ "unknown-kex", "weird-kex" };
+    const server_methods = [_][]const u8{"curve25519-sha256"};
+    try std.testing.expectError(error.UnsupportedMethod, negotiate_kex_method(&client_methods, &server_methods));
+}
+
+test "validate negotiated kex method accepts expected selection" {
+    const client_methods = [_][]const u8{ "curve25519-sha256", "diffie-hellman-group14-sha256" };
+    const server_methods = [_][]const u8{"curve25519-sha256"};
+    const selected = try validate_negotiated_kex_method(&client_methods, &server_methods, "curve25519-sha256");
+    try std.testing.expectEqual(KexMethod.curve25519_sha256, selected);
+}
+
+test "compute exchange hash requires both ephemeral public keys" {
+    const allocator = std.testing.allocator;
+
+    var state = KexState.init(allocator, .curve25519_sha256, true, "client-id", "server-id", "init", "reply");
+    defer state.deinit();
+
+    const pub_key = try state.generateKeyPair();
+    defer allocator.free(pub_key);
+    try std.testing.expectError(error.InvalidPublicKey, state.computeExchangeHash("host-key"));
+}
