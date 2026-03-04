@@ -1,4 +1,5 @@
 const std = @import("std");
+const ssh_algorithms = @import("algorithms.zig");
 
 pub const HostKeyError = error{
     InvalidSignatureBlob,
@@ -16,7 +17,7 @@ pub fn encode_ed25519_signature_blob(
     allocator: std.mem.Allocator,
     signature: *const [64]u8,
 ) ![]u8 {
-    const algorithm = "ssh-ed25519";
+    const algorithm = ssh_algorithms.SignatureAlgorithm.ssh_ed25519.name();
     const blob_size = 4 + algorithm.len + 4 + signature.len;
     const signature_blob = try allocator.alloc(u8, blob_size);
     errdefer allocator.free(signature_blob);
@@ -43,7 +44,7 @@ fn decode_ed25519_signature_blob_internal(blob: []const u8, strict: bool) HostKe
 
     const algorithm = try read_ssh_field(blob, &offset, error.InvalidSignatureBlob);
 
-    if (!std.mem.eql(u8, algorithm, "ssh-ed25519")) return error.UnsupportedAlgorithm;
+    if (!std.mem.eql(u8, algorithm, ssh_algorithms.SignatureAlgorithm.ssh_ed25519.name())) return error.UnsupportedAlgorithm;
 
     const signature_slice = try read_ssh_field(blob, &offset, error.InvalidSignatureBlob);
 
@@ -63,7 +64,7 @@ pub fn encode_ed25519_host_key_blob(
     allocator: std.mem.Allocator,
     public_key: *const [32]u8,
 ) ![]u8 {
-    const algorithm = "ssh-ed25519";
+    const algorithm = ssh_algorithms.HostKeyAlgorithm.ssh_ed25519.name();
     const blob_size = 4 + algorithm.len + 4 + public_key.len;
     const host_key_blob = try allocator.alloc(u8, blob_size);
     errdefer allocator.free(host_key_blob);
@@ -90,7 +91,7 @@ fn decode_ed25519_host_key_blob_internal(blob: []const u8, strict: bool) HostKey
 
     const algorithm = try read_ssh_field(blob, &offset, error.InvalidHostKeyBlob);
 
-    if (!std.mem.eql(u8, algorithm, "ssh-ed25519")) return error.UnsupportedAlgorithm;
+    if (!std.mem.eql(u8, algorithm, ssh_algorithms.HostKeyAlgorithm.ssh_ed25519.name())) return error.UnsupportedAlgorithm;
 
     const public_key_slice = try read_ssh_field(blob, &offset, error.InvalidHostKeyBlob);
 
