@@ -1128,3 +1128,49 @@ test "build server hello rejects invalid local transport params" {
     try std.testing.expect(server.getSelectedAlpn() == null);
     try std.testing.expect(server.getPeerTransportParams() == null);
 }
+
+test "tls context invalid state matrix is stable" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+    var server = TlsContext.init(allocator, false);
+    defer server.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    try std.testing.expectError(
+        error.InvalidState,
+        server.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded),
+    );
+    try std.testing.expectEqual(HandshakeState.idle, server.state);
+
+    try std.testing.expectError(error.InvalidState, client.completeHandshake("shared-secret"));
+    try std.testing.expectEqual(HandshakeState.idle, client.state);
+
+    try std.testing.expectError(
+        error.InvalidState,
+        client.buildServerHelloFromClientHello("bad", &offered, server_tp_encoded),
+    );
+    try std.testing.expectEqual(HandshakeState.idle, client.state);
+
+    try std.testing.expectError(error.InvalidState, server.processServerHello("bad"));
+    try std.testing.expectEqual(HandshakeState.idle, server.state);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, client.state);
+
+    try std.testing.expectError(
+        error.InvalidState,
+        client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded),
+    );
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, client.state);
+}
