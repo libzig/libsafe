@@ -280,3 +280,49 @@ test "adapter rejects invalid operation order" {
     try std.testing.expectError(error.InvalidState, server_engine.beginClientHandshake("example.com", &[_][]const u8{"h3"}, &[_]u8{}));
     try std.testing.expectError(error.InvalidState, server_engine.processServerHello("bad"));
 }
+
+test "adapter exposes selected ALPN and peer transport params after server hello" {
+    const allocator = std.testing.allocator;
+
+    var client_adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer client_adapter.deinit();
+    var server_adapter = LibfastTlsContextAdapter.init(allocator, .server);
+    defer server_adapter.deinit();
+
+    var client_engine = client_adapter.asEngine();
+    var server_engine = server_adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const client_hello = try client_engine.beginClientHandshake("example.com", &offered, client_tp_encoded);
+    defer client_engine.freeBuffer(client_hello);
+
+    const server_hello = try server_engine.buildServerHello(client_hello, &offered, server_tp_encoded);
+    defer server_engine.freeBuffer(server_hello);
+
+    try client_engine.processServerHello(server_hello);
+
+    const selected_alpn = client_engine.getSelectedAlpn() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("h3", selected_alpn);
+
+    const peer_tp = client_engine.getPeerTransportParams() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, server_tp_encoded, peer_tp);
+}
+
+test "adapter selected ALPN and peer transport params are null before processing" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    try std.testing.expect(tls_engine.getSelectedAlpn() == null);
+    try std.testing.expect(tls_engine.getPeerTransportParams() == null);
+}
