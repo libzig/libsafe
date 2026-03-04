@@ -961,6 +961,57 @@ test "build server hello rejects malformed client ALPN extension payload" {
     try std.testing.expectEqual(HandshakeState.idle, server.state);
 }
 
+test "process server hello rejects unsupported cipher without mutating client state" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const sh = handshake_mod.ServerHello{
+        .random = [_]u8{0x41} ** 32,
+        .cipher_suite = 0xDEAD,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const sh_bytes = try sh.encode(allocator);
+    defer allocator.free(sh_bytes);
+
+    try std.testing.expectError(error.UnsupportedCipherSuite, client.processServerHello(sh_bytes));
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, client.state);
+    try std.testing.expect(client.cipher_suite == null);
+    try std.testing.expect(client.getSelectedAlpn() == null);
+    try std.testing.expect(client.getPeerTransportParams() == null);
+}
+
+test "process server hello rejects malformed payload without mutating client state" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const malformed = [_]u8{ 0x02, 0x00, 0x01, 0x00 };
+    try std.testing.expectError(error.HandshakeFailed, client.processServerHello(&malformed));
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, client.state);
+    try std.testing.expect(client.cipher_suite == null);
+    try std.testing.expect(client.getSelectedAlpn() == null);
+    try std.testing.expect(client.getPeerTransportParams() == null);
+}
+
 test "complete handshake unsupported cipher returns error without state change" {
     const allocator = std.testing.allocator;
 
