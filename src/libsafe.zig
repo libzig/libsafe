@@ -11,6 +11,7 @@ pub const keys = @import("crypto/keys.zig");
 pub const header_protection = @import("crypto/header_protection.zig");
 pub const crypto = @import("crypto/crypto.zig");
 pub const tls_handshake = @import("tls/handshake.zig");
+pub const tls_contract = @import("tls/contract.zig");
 pub const tls_extensions = @import("tls/extensions.zig");
 pub const tls_finished = @import("tls/finished.zig");
 pub const tls_interop = @import("tls/interop.zig");
