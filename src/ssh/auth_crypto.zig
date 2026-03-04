@@ -92,6 +92,66 @@ test "auth signature verify rejects unsupported algorithm" {
     );
 }
 
+test "auth signature verify rejects malformed trailing bytes" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(77);
+    const kp = ssh_signature.KeyPair.generate(prng.random());
+    const payload = "auth-payload";
+
+    const blob = try create_ed25519_auth_signature_blob(allocator, payload, &kp.private_key);
+    defer allocator.free(blob);
+
+    const padded = try allocator.alloc(u8, blob.len + 1);
+    defer allocator.free(padded);
+    @memcpy(padded[0..blob.len], blob);
+    padded[padded.len - 1] = 0xEE;
+
+    try std.testing.expectError(
+        error.SignatureBlobMalformed,
+        verify_ed25519_auth_signature_blob(payload, padded, &kp.public_key),
+    );
+}
+
+test "auth signature verify maps invalid signature length" {
+    const allocator = std.testing.allocator;
+    const bad_blob = try allocator.alloc(u8, 4 + 11 + 4 + 63);
+    defer allocator.free(bad_blob);
+
+    var offset: usize = 0;
+    std.mem.writeInt(u32, bad_blob[offset..][0..4], 11, .big);
+    offset += 4;
+    @memcpy(bad_blob[offset .. offset + 11], "ssh-ed25519");
+    offset += 11;
+    std.mem.writeInt(u32, bad_blob[offset..][0..4], 63, .big);
+    offset += 4;
+    @memset(bad_blob[offset .. offset + 63], 0xBB);
+
+    const pk: [32]u8 = [_]u8{0x33} ** 32;
+    try std.testing.expectError(
+        error.SignatureLengthInvalid,
+        verify_ed25519_auth_signature_blob("payload", bad_blob, &pk),
+    );
+}
+
+test "auth signature verify rejects wrong payload and public key size" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(91);
+    const kp = ssh_signature.KeyPair.generate(prng.random());
+
+    const blob = try create_ed25519_auth_signature_blob(allocator, "right", &kp.private_key);
+    defer allocator.free(blob);
+
+    try std.testing.expectError(
+        error.VerificationFailed,
+        verify_ed25519_auth_signature_blob("wrong", blob, &kp.public_key),
+    );
+
+    try std.testing.expectError(
+        error.PublicKeyLengthInvalid,
+        verify_ed25519_auth_signature_blob("right", blob, "short"),
+    );
+}
+
 test "timing safe equal utility" {
     const a = [_]u8{ 1, 2, 3, 4 };
     const b = [_]u8{ 1, 2, 3, 4 };
