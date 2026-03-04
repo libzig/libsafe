@@ -1142,6 +1142,43 @@ test "process server hello succeeds without ALPN when none offered" {
     try std.testing.expectEqualSlices(u8, server_tp_encoded, peer_tp);
 }
 
+test "process server hello accepts out of order ALPN and transport extensions" {
+    const allocator = std.testing.allocator;
+
+    var client = TlsContext.init(allocator, true);
+    defer client.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const ch = try client.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(ch);
+
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = server_tp_encoded,
+        },
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &[_]u8{ 0x00, 0x03, 0x02, 'h', '3' },
+        },
+    };
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try client.processServerHello(sh);
+    try std.testing.expectEqual(HandshakeState.server_hello_received, client.state);
+    try std.testing.expectEqualStrings("h3", client.getSelectedAlpn().?);
+    try std.testing.expectEqualSlices(u8, server_tp_encoded, client.getPeerTransportParams().?);
+}
+
 test "verify finished data accepts matching verify_data" {
     const allocator = std.testing.allocator;
 
