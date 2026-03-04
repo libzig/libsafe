@@ -325,3 +325,56 @@ test "find unique extension rejects truncated extension payload" {
         findUniqueExtension(&extensions, @intFromEnum(ExtensionType.quic_transport_parameters)),
     );
 }
+
+test "find unique extension returns null when extension is absent" {
+    const extensions = [_]u8{
+        0x00, 0x2B, 0x00, 0x02, 0x03, 0x04,
+    };
+    const result = try findUniqueExtension(&extensions, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
+    try std.testing.expect(result == null);
+}
+
+test "parse client hello rejects unsupported legacy version" {
+    const allocator = std.testing.allocator;
+    const suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ch = ClientHello{ .random = [_]u8{0x55} ** 32, .cipher_suites = &suites, .extensions = &.{} };
+    const encoded = try ch.encode(allocator);
+    defer allocator.free(encoded);
+
+    var mutated = try allocator.dupe(u8, encoded);
+    defer allocator.free(mutated);
+    mutated[4] = 0x03;
+    mutated[5] = 0x01;
+
+    try std.testing.expectError(error.UnsupportedVersion, parseClientHello(mutated));
+}
+
+test "parse server hello rejects unsupported legacy version" {
+    const allocator = std.testing.allocator;
+    const sh = ServerHello{ .random = [_]u8{0x66} ** 32, .cipher_suite = TLS_AES_128_GCM_SHA256, .extensions = &.{} };
+    const encoded = try sh.encode(allocator);
+    defer allocator.free(encoded);
+
+    var mutated = try allocator.dupe(u8, encoded);
+    defer allocator.free(mutated);
+    mutated[4] = 0x03;
+    mutated[5] = 0x01;
+
+    try std.testing.expectError(error.UnsupportedVersion, parseServerHello(mutated));
+}
+
+test "client hello encode rejects oversized extension data" {
+    const allocator = std.testing.allocator;
+    const suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const oversized = try allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 0xAB);
+
+    const ext = [_]Extension{.{
+        .extension_type = @intFromEnum(ExtensionType.quic_transport_parameters),
+        .extension_data = oversized,
+    }};
+    const ch = ClientHello{ .random = [_]u8{0x77} ** 32, .cipher_suites = &suites, .extensions = &ext };
+
+    try std.testing.expectError(error.InvalidMessage, ch.encode(allocator));
+}
