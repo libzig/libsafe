@@ -474,3 +474,51 @@ test "adapter enforces single-use handshake transitions" {
     try server_engine.completeHandshake("shared-secret");
     try std.testing.expectError(error.InvalidState, client_engine.completeHandshake("shared-secret"));
 }
+
+test "adapter maps malformed ALPN extension payload during process server hello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    const bad_alpn = [_]u8{ 0x00, 0x04, 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        .extension_data = &bad_alpn,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+    try std.testing.expect(tls_engine.getSelectedAlpn() == null);
+    try std.testing.expect(tls_engine.getPeerTransportParams() == null);
+}
+
+test "adapter maps zero length ALPN selection during process server hello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    const bad_alpn = [_]u8{ 0x00, 0x01, 0x00 };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        .extension_data = &bad_alpn,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
+    try std.testing.expectEqual(engine.HandshakeState.client_hello_sent, tls_engine.state());
+}
