@@ -378,3 +378,34 @@ test "client hello encode rejects oversized extension data" {
 
     try std.testing.expectError(error.InvalidMessage, ch.encode(allocator));
 }
+
+test "server hello encode rejects oversized extension data" {
+    const allocator = std.testing.allocator;
+    const oversized = try allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 0xCD);
+
+    const ext = [_]Extension{.{
+        .extension_type = @intFromEnum(ExtensionType.application_layer_protocol_negotiation),
+        .extension_data = oversized,
+    }};
+    const sh = ServerHello{ .random = [_]u8{0x88} ** 32, .cipher_suite = TLS_AES_128_GCM_SHA256, .extensions = &ext };
+
+    try std.testing.expectError(error.InvalidMessage, sh.encode(allocator));
+}
+
+test "parse client hello rejects zero compression methods" {
+    const allocator = std.testing.allocator;
+    const suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ch = ClientHello{ .random = [_]u8{0x44} ** 32, .cipher_suites = &suites, .extensions = &.{} };
+    const encoded = try ch.encode(allocator);
+    defer allocator.free(encoded);
+
+    var mutated = try allocator.dupe(u8, encoded);
+    defer allocator.free(mutated);
+
+    const compression_len_offset = 4 + 2 + 32 + 1 + 2 + 2;
+    mutated[compression_len_offset] = 0;
+
+    try std.testing.expectError(error.InvalidMessage, parseClientHello(mutated));
+}
