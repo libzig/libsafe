@@ -454,3 +454,68 @@ test "quic secrets zeroize clears both directions" {
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 32, &secrets.client_initial_secret);
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 32, &secrets.server_initial_secret);
 }
+
+test "expand label is deterministic across invocations" {
+    const secret = "test-secret-material";
+    const label = "traffic";
+    const context = "ctx";
+
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    try expandLabel(secret, label, context, 32, .sha256, &a);
+    try expandLabel(secret, label, context, 32, .sha256, &b);
+
+    try std.testing.expectEqualSlices(u8, &a, &b);
+}
+
+test "expand label output changes with hash algorithm" {
+    const secret = "test-secret-material";
+    const label = "traffic";
+    const context = "ctx";
+
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    try expandLabel(secret, label, context, 32, .sha256, &a);
+    try expandLabel(secret, label, context, 32, .sha384, &b);
+
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "expand label rejects oversized length and short output" {
+    const secret = "test-secret-material";
+
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(
+        error.DerivationFailed,
+        expandLabel(secret, "label", "ctx", 17, .sha256, &out),
+    );
+
+    var big_out: [32]u8 = undefined;
+    try std.testing.expectError(
+        error.DerivationFailed,
+        expandLabel(secret, "label", "ctx", 0x1_0000, .sha256, &big_out),
+    );
+}
+
+test "expand label rejects oversized label and context encodings" {
+    const allocator = std.testing.allocator;
+    const secret = "test-secret-material";
+
+    const huge_label = try allocator.alloc(u8, 300);
+    defer allocator.free(huge_label);
+    @memset(huge_label, 'l');
+
+    const huge_context = try allocator.alloc(u8, 256);
+    defer allocator.free(huge_context);
+    @memset(huge_context, 'c');
+
+    var out: [32]u8 = undefined;
+    try std.testing.expectError(
+        error.DerivationFailed,
+        expandLabel(secret, huge_label, "", 32, .sha256, &out),
+    );
+    try std.testing.expectError(
+        error.DerivationFailed,
+        expandLabel(secret, "label", huge_context, 32, .sha256, &out),
+    );
+}
