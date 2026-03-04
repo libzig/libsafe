@@ -11,7 +11,17 @@ pub const RekeyThresholdPolicy = struct {
     max_seconds: u64,
 
     pub fn should_rekey(self: RekeyThresholdPolicy, bytes_since_last_rekey: u64, seconds_since_last_rekey: u64) bool {
-        return bytes_since_last_rekey >= self.max_bytes or seconds_since_last_rekey >= self.max_seconds;
+        return self.should_rekey_by_bytes(bytes_since_last_rekey) or self.should_rekey_by_time(seconds_since_last_rekey);
+    }
+
+    pub fn should_rekey_by_bytes(self: RekeyThresholdPolicy, bytes_since_last_rekey: u64) bool {
+        if (self.max_bytes == 0) return false;
+        return bytes_since_last_rekey >= self.max_bytes;
+    }
+
+    pub fn should_rekey_by_time(self: RekeyThresholdPolicy, seconds_since_last_rekey: u64) bool {
+        if (self.max_seconds == 0) return false;
+        return seconds_since_last_rekey >= self.max_seconds;
     }
 };
 
@@ -103,11 +113,59 @@ pub fn derive_next_generation_traffic_secrets(
     };
 }
 
+pub fn derive_updated_traffic_secrets(
+    current: *const RekeyTrafficSecrets,
+    context_label: RekeyContextLabel,
+    generation: u32,
+) RekeyTrafficSecrets {
+    var generation_context: [4]u8 = undefined;
+    std.mem.writeInt(u32, &generation_context, generation, .big);
+
+    var client_to_server: [32]u8 = undefined;
+    var server_to_client: [32]u8 = undefined;
+
+    const client_label = switch (context_label) {
+        .handshake => "rekey/update/client/handshake",
+        .application => "rekey/update/client/application",
+        .update => "rekey/update/client/update",
+    };
+    const server_label = switch (context_label) {
+        .handshake => "rekey/update/server/handshake",
+        .application => "rekey/update/server/application",
+        .update => "rekey/update/server/update",
+    };
+
+    var client_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&current.client_to_server);
+    client_hmac.update(client_label);
+    client_hmac.update(&generation_context);
+    client_hmac.final(&client_to_server);
+
+    var server_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&current.server_to_client);
+    server_hmac.update(server_label);
+    server_hmac.update(&generation_context);
+    server_hmac.final(&server_to_client);
+
+    return .{
+        .client_to_server = client_to_server,
+        .server_to_client = server_to_client,
+    };
+}
+
 test "rekey threshold policy checks bytes and time" {
     const policy = RekeyThresholdPolicy{ .max_bytes = 1024, .max_seconds = 60 };
     try std.testing.expect(!policy.should_rekey(512, 10));
     try std.testing.expect(policy.should_rekey(1024, 10));
     try std.testing.expect(policy.should_rekey(1, 60));
+}
+
+test "rekey threshold policy allows disabling individual thresholds" {
+    const bytes_only = RekeyThresholdPolicy{ .max_bytes = 1024, .max_seconds = 0 };
+    try std.testing.expect(!bytes_only.should_rekey(100, 99999));
+    try std.testing.expect(bytes_only.should_rekey(1024, 0));
+
+    const time_only = RekeyThresholdPolicy{ .max_bytes = 0, .max_seconds = 60 };
+    try std.testing.expect(!time_only.should_rekey(99999, 10));
+    try std.testing.expect(time_only.should_rekey(0, 60));
 }
 
 test "derive next generation traffic secrets varies by generation" {
@@ -135,6 +193,26 @@ test "derive next generation traffic secrets varies by generation" {
 
     try std.testing.expect(!std.mem.eql(u8, &g1.client_to_server, &g2.client_to_server));
     try std.testing.expect(!std.mem.eql(u8, &g1.server_to_client, &g2.server_to_client));
+}
+
+test "derive updated traffic secrets is deterministic and generation scoped" {
+    var current = RekeyTrafficSecrets{
+        .client_to_server = [_]u8{0x1A} ** 32,
+        .server_to_client = [_]u8{0x2B} ** 32,
+    };
+    defer current.zeroize();
+
+    var g1a = derive_updated_traffic_secrets(&current, .application, 1);
+    defer g1a.zeroize();
+    var g1b = derive_updated_traffic_secrets(&current, .application, 1);
+    defer g1b.zeroize();
+    var g2 = derive_updated_traffic_secrets(&current, .application, 2);
+    defer g2.zeroize();
+
+    try std.testing.expectEqualSlices(u8, &g1a.client_to_server, &g1b.client_to_server);
+    try std.testing.expectEqualSlices(u8, &g1a.server_to_client, &g1b.server_to_client);
+    try std.testing.expect(!std.mem.eql(u8, &g1a.client_to_server, &g2.client_to_server));
+    try std.testing.expect(!std.mem.eql(u8, &g1a.server_to_client, &g2.server_to_client));
 }
 
 test "owned secret buffer stores independent copy" {
