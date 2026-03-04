@@ -1,6 +1,7 @@
 const std = @import("std");
 const tls_extensions = @import("extensions.zig");
 const tls_finished = @import("finished.zig");
+const tls_policy = @import("policy.zig");
 const handshake_mod = @import("handshake.zig");
 const key_schedule_mod = @import("key_schedule.zig");
 const tls_diag = @import("diagnostics.zig");
@@ -140,7 +141,7 @@ pub const TlsContext = struct {
         };
 
         const parsed_client_hello = handshake_mod.parseClientHello(client_hello_data) catch return error.HandshakeFailed;
-        const selected_cipher = selectServerCipherSuite(parsed_client_hello.cipher_suites) orelse return error.UnsupportedCipherSuite;
+        const selected_cipher = tls_policy.select_server_cipher_suite(parsed_client_hello.cipher_suites) orelse return error.UnsupportedCipherSuite;
 
         const selected_alpn = try selectServerAlpnFromClientHello(client_hello_data, server_supported_alpn);
         const selected_alpn_wire = try encodeSelectedAlpnExtensionData(self.allocator, selected_alpn);
@@ -192,7 +193,7 @@ pub const TlsContext = struct {
     pub fn completeHandshake(self: *TlsContext, shared_secret: []const u8) TlsError!void {
         if (self.state != .server_hello_received) return error.InvalidState;
 
-        const hash_alg = try tlsHashAlgorithmForCipherSuite(self.cipher_suite orelse handshake_mod.TLS_AES_128_GCM_SHA256);
+        const hash_alg = tls_policy.hash_algorithm_for_cipher_suite(self.cipher_suite orelse handshake_mod.TLS_AES_128_GCM_SHA256) catch return error.UnsupportedCipherSuite;
 
         try self.deriveAndInstallTrafficSecrets(hash_alg, shared_secret);
         self.state = .handshake_complete;
@@ -240,16 +241,6 @@ pub const TlsContext = struct {
         const ks_ptr = try self.allocator.create(key_schedule_mod.KeySchedule);
         ks_ptr.* = ks;
         self.key_schedule = ks_ptr;
-    }
-
-    fn tlsHashAlgorithmForCipherSuite(cipher_suite: u16) TlsError!key_schedule_mod.HashAlgorithm {
-        return switch (cipher_suite) {
-            handshake_mod.TLS_AES_128_GCM_SHA256,
-            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
-            => .sha256,
-            handshake_mod.TLS_AES_256_GCM_SHA384 => .sha384,
-            else => error.UnsupportedCipherSuite,
-        };
     }
 
     fn applyServerHelloExtensions(self: *TlsContext, extensions: []const u8) TlsError!void {
@@ -372,25 +363,6 @@ pub const TlsContext = struct {
         const copied = try self.allocator.dupe(u8, tp_data);
         if (self.peer_transport_params) |old| self.allocator.free(old);
         self.peer_transport_params = copied;
-    }
-
-    fn selectServerCipherSuite(offered_cipher_suites: []const u8) ?u16 {
-        if ((offered_cipher_suites.len & 1) != 0) return null;
-
-        const preferred = [_]u16{
-            handshake_mod.TLS_AES_128_GCM_SHA256,
-            handshake_mod.TLS_AES_256_GCM_SHA384,
-            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
-        };
-
-        for (preferred) |candidate| {
-            var i: usize = 0;
-            while (i + 1 < offered_cipher_suites.len) : (i += 2) {
-                const offered: u16 = (@as(u16, offered_cipher_suites[i]) << 8) | offered_cipher_suites[i + 1];
-                if (offered == candidate) return candidate;
-            }
-        }
-        return null;
     }
 
     pub fn deinit(self: *TlsContext) void {
@@ -1061,17 +1033,17 @@ test "complete handshake uses sha384 schedule for aes256 suite" {
 test "tls hash algorithm mapping follows cipher suite" {
     try std.testing.expectEqual(
         key_schedule_mod.HashAlgorithm.sha256,
-        try TlsContext.tlsHashAlgorithmForCipherSuite(handshake_mod.TLS_AES_128_GCM_SHA256),
+        try tls_policy.hash_algorithm_for_cipher_suite(handshake_mod.TLS_AES_128_GCM_SHA256),
     );
     try std.testing.expectEqual(
         key_schedule_mod.HashAlgorithm.sha256,
-        try TlsContext.tlsHashAlgorithmForCipherSuite(handshake_mod.TLS_CHACHA20_POLY1305_SHA256),
+        try tls_policy.hash_algorithm_for_cipher_suite(handshake_mod.TLS_CHACHA20_POLY1305_SHA256),
     );
     try std.testing.expectEqual(
         key_schedule_mod.HashAlgorithm.sha384,
-        try TlsContext.tlsHashAlgorithmForCipherSuite(handshake_mod.TLS_AES_256_GCM_SHA384),
+        try tls_policy.hash_algorithm_for_cipher_suite(handshake_mod.TLS_AES_256_GCM_SHA384),
     );
-    try std.testing.expectError(error.UnsupportedCipherSuite, TlsContext.tlsHashAlgorithmForCipherSuite(0xDEAD));
+    try std.testing.expectError(error.UnsupportedCipherSuite, tls_policy.hash_algorithm_for_cipher_suite(0xDEAD));
 }
 
 test "validate ALPN list wire guards malformed lengths" {
