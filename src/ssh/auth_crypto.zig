@@ -233,6 +233,38 @@ test "auth signature verify with host key blob rejects algorithm mismatch" {
     );
 }
 
+test "auth signature verify with host key blob rejects wrong payload" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(303);
+    const kp = ssh_signature.KeyPair.generate(prng.random());
+
+    const signature_blob = try create_ed25519_auth_signature_blob(allocator, "right-payload", &kp.private_key);
+    defer allocator.free(signature_blob);
+
+    const host_key_blob = try ssh_hostkey.encode_ed25519_host_key_blob(allocator, &kp.public_key);
+    defer allocator.free(host_key_blob);
+
+    try std.testing.expectError(
+        error.VerificationFailed,
+        verify_ed25519_auth_signature_with_host_key_blob("wrong-payload", signature_blob, host_key_blob),
+    );
+}
+
+test "auth signature verify with host key blob maps signature format errors" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(404);
+    const kp = ssh_signature.KeyPair.generate(prng.random());
+
+    const host_key_blob = try ssh_hostkey.encode_ed25519_host_key_blob(allocator, &kp.public_key);
+    defer allocator.free(host_key_blob);
+
+    const malformed_signature_blob = [_]u8{ 0x00, 0x00, 0x00, 0x0B, 's', 's', 'h', '-', 'e', 'd', '2' };
+    try std.testing.expectError(
+        error.SignatureBlobMalformed,
+        verify_ed25519_auth_signature_with_host_key_blob("payload", &malformed_signature_blob, host_key_blob),
+    );
+}
+
 test "timing safe equal utility" {
     const a = [_]u8{ 1, 2, 3, 4 };
     const b = [_]u8{ 1, 2, 3, 4 };
