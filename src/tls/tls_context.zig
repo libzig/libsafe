@@ -649,3 +649,63 @@ test "process server hello rejects duplicate transport parameter extensions" {
 
     try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(sh));
 }
+
+test "process server hello failure preserves client state and extracted fields" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const offered = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const ch = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(ch);
+
+    const bad_tp = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        .extension_data = &bad_tp,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(sh));
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, ctx.state);
+    try std.testing.expect(ctx.getSelectedAlpn() == null);
+    try std.testing.expect(ctx.getPeerTransportParams() == null);
+}
+
+test "select server alpn rejects malformed offered wire" {
+    const server_supported = [_][]const u8{"h3"};
+    const malformed = [_]u8{ 0x00, 0x05, 0x02, 'h', '3' };
+    try std.testing.expectError(error.HandshakeFailed, TlsContext.selectServerAlpn(&malformed, &server_supported));
+}
+
+test "select server alpn from client hello requires ALPN extension" {
+    const allocator = std.testing.allocator;
+
+    const suites = [_]u16{handshake_mod.TLS_AES_128_GCM_SHA256};
+    const random: [32]u8 = [_]u8{0x99} ** 32;
+    const tp_payload = [_]u8{0x00};
+    const extensions = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        .extension_data = &tp_payload,
+    }};
+
+    const ch = handshake_mod.ClientHello{
+        .random = random,
+        .cipher_suites = &suites,
+        .extensions = &extensions,
+    };
+    const encoded = try ch.encode(allocator);
+    defer allocator.free(encoded);
+
+    const server_supported = [_][]const u8{"h3"};
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        TlsContext.selectServerAlpnFromClientHello(encoded, &server_supported),
+    );
+}
