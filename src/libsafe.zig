@@ -19,6 +19,7 @@ pub const ssh_secrets = @import("ssh/secret_derivation.zig");
 pub const ssh_ecdh = @import("ssh/ecdh.zig");
 pub const ssh_signature = @import("ssh/signature.zig");
 pub const ssh_hostkey = @import("ssh/hostkey.zig");
+pub const ssh_auth_crypto = @import("ssh/auth_crypto.zig");
 
 test {
     std.testing.refAllDecls(@This());
