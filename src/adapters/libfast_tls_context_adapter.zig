@@ -134,6 +134,19 @@ pub const LibfastTlsContextAdapter = struct {
     }
 };
 
+fn makeServerHelloWithExtensions(
+    allocator: std.mem.Allocator,
+    extensions: []const handshake_mod.Extension,
+) ![]u8 {
+    const random: [32]u8 = [_]u8{0x33} ** 32;
+    const msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = extensions,
+    };
+    return msg.encode(allocator);
+}
+
 test "adapter begins client handshake" {
     const allocator = std.testing.allocator;
 
@@ -325,4 +338,70 @@ test "adapter selected ALPN and peer transport params are null before processing
 
     try std.testing.expect(tls_engine.getSelectedAlpn() == null);
     try std.testing.expect(tls_engine.getPeerTransportParams() == null);
+}
+
+test "adapter maps ALPN mismatch during process server hello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    const alpn_h2 = [_]u8{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        .extension_data = &alpn_h2,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.AlpnMismatch, tls_engine.processServerHello(sh));
+}
+
+test "adapter maps invalid transport parameters during process server hello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    const bad_tp = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+    const ext = [_]handshake_mod.Extension{.{
+        .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        .extension_data = &bad_tp,
+    }};
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
+}
+
+test "adapter maps duplicate ALPN extensions during process server hello" {
+    const allocator = std.testing.allocator;
+
+    var adapter = LibfastTlsContextAdapter.init(allocator, .client);
+    defer adapter.deinit();
+    var tls_engine = adapter.asEngine();
+
+    const offered = [_][]const u8{"h3"};
+    const ch = try tls_engine.beginClientHandshake("example.com", &offered, &[_]u8{});
+    defer tls_engine.freeBuffer(ch);
+
+    const alpn_h3 = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h3 },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h3 },
+    };
+    const sh = try makeServerHelloWithExtensions(allocator, &ext);
+    defer allocator.free(sh);
+
+    try std.testing.expectError(error.HandshakeFailed, tls_engine.processServerHello(sh));
 }
