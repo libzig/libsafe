@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.0.8] - 2026-03-05
+
+### <!-- 0 -->⛰️  Features
+
+- Add TLS handshake matrix aggregation hooks
+- Add TLS API boundary contract module
+- Add full TLS interop handshake case hooks
+- Add TLS interop case hooks
+- Add TLS diagnostics and keylog callback helpers
+- Add TLS auth validation helpers and diagnostics credit
+
+### <!-- 2 -->🚜 Refactor
+
+- Extract TLS cipher policy helpers
+- Extract TLS finished verification helper
+- Extract TLS extension parsing helpers
+- Unify TLS ALPN wire validation helpers
+- Split TLS context handshake phase helpers
+
+### <!-- 6 -->🧪 Testing
+
+- Add a test for badssl-like matrix stability
+
 ## [0.0.7] - 2026-03-04
 
 ### <!-- 0 -->⛰️  Features
