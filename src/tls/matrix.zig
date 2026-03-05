@@ -22,6 +22,27 @@ pub const MatrixResult = struct {
     mismatches: usize,
 };
 
+const BADSSL_LIKE_MISMATCH_ALPN = [_][]const u8{"h2"};
+const BADSSL_LIKE_BAD_TP = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+
+pub const BADSSL_LIKE_FULL_HANDSHAKE_MATRIX = [_]MatrixEntry{
+    .{
+        .name = "baseline-success",
+        .case = .{},
+        .expected = .success,
+    },
+    .{
+        .name = "alpn-mismatch-like",
+        .case = .{ .server_supported_alpn = &BADSSL_LIKE_MISMATCH_ALPN },
+        .expected = .alpn_mismatch,
+    },
+    .{
+        .name = "malformed-transport-params-like",
+        .case = .{ .server_transport_params = &BADSSL_LIKE_BAD_TP },
+        .expected = .handshake_failed,
+    },
+};
+
 pub fn run_full_handshake_matrix(
     allocator: std.mem.Allocator,
     entries: []const MatrixEntry,
@@ -96,4 +117,15 @@ test "full handshake matrix aggregates outcomes and mismatches" {
     try std.testing.expectEqual(@as(usize, 1), result.stats.alpn_mismatch);
     try std.testing.expectEqual(@as(usize, 1), result.stats.handshake_failed);
     try std.testing.expectEqual(@as(usize, 1), result.mismatches);
+}
+
+test "badssl-like matrix subset stays stable" {
+    const allocator = std.testing.allocator;
+    const result = try run_full_handshake_matrix(allocator, &BADSSL_LIKE_FULL_HANDSHAKE_MATRIX);
+
+    try std.testing.expectEqual(@as(usize, BADSSL_LIKE_FULL_HANDSHAKE_MATRIX.len), result.stats.total);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.success);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.alpn_mismatch);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.handshake_failed);
+    try std.testing.expectEqual(@as(usize, 0), result.mismatches);
 }
