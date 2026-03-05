@@ -8,6 +8,7 @@ These upstream projects informed implementation choices and verification strateg
 
 - **[LSQUIC](https://github.com/litespeedtech/lsquic)**
 - **Docs**: https://lsquic.readthedocs.io/
+- **[tls.zig](https://github.com/ianic/tls.zig)** for practical TLS 1.2/1.3 handshake structure, transcript management, and broad interoperability/testing patterns.
 
 ## Protocol and standards references
 
